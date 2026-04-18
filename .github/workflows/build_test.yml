@@ -1,0 +1,85 @@
+name: Build and Test Workflow
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - devtask/*
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description:  Provide the branch/tag to build and test
+        required: false
+
+jobs:
+
+  build_test:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
+    steps:
+    
+      - name: Check out code
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
+
+      - name: Detect build system
+        id: detect
+        run: |
+          if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+          else
+            echo "No supported build file found!" >&2
+            exit 1
+          fi
+
+      - name: Setup Maven Action
+        if: steps.detect.outputs.build_system == 'maven'
+        uses: s4u/setup-maven-action@v1.18.0
+        with:
+          checkout-enabled: false # Do not checkout internally
+          java-version: 11
+
+      - name: Setup Gradle Action
+        if: steps.detect.outputs.build_system == 'gradle'
+        uses: spring-io/spring-gradle-build-action@v2
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Create settings.xml
+        if: steps.detect.outputs.build_system == 'maven'
+        run: echo "${{ vars.MAVEN_SETTINGS_XML }}" | base64 -d > settings.xml
+
+      - name: Create artifactory-init.gradle
+        if: steps.detect.outputs.build_system == 'gradle'
+        run: |
+          mkdir -p gradle
+          echo "${{ vars.ARTIFACTORY_INIT_GRADLE }}" | base64 -d > gradle/artifactory-init.gradle
+
+      - name: Run Maven tests
+        if: steps.detect.outputs.build_system == 'maven'
+        run: mvn test
+
+      - name: Run Maven Build
+        if: steps.detect.outputs.build_system == 'maven'
+        run: mvn -B package -DskipTests --file pom.xml
+
+      - name: Run Gradle Build
+        if: steps.detect.outputs.build_system == 'gradle'
+        env:
+          ARTIFACTORY_USER: ${{ secrets.JFROG_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+          ARTIFACTORY_URL: https://${{ secrets.JFROG_HOST_NAME }}/artifactory
+          ARTIFACTORY_REPO: ${{ secrets.MAVEN_STAGING_ARTIFACTORY }}
+        run: ./gradlew clean build --init-script gradle/artifactory-init.gradle --no-daemon -PskipCheckExpectedBranchVersion --continue -x test
+
+      - name: Run Gradle tests
+        if: steps.detect.outputs.build_system == 'gradle'
+        run: ./gradlew test
+

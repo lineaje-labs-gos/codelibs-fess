@@ -1,0 +1,198 @@
+name: Publish Workflow
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - devtask/*
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description:  Provide the branch/tag to build and test
+        required: false
+      fixed_cves:
+        description:  Provide the list of CVEs fixed by this version
+        required: false
+
+jobs:
+
+  build_test:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
+    steps:
+
+      - name: Check out code
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
+
+      - name: Detect build system
+        id: detect
+        run: |
+          if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+          else
+            echo "No supported build file found!" >&2
+            exit 1
+          fi
+
+      - name: Setup Maven Action
+        if: steps.detect.outputs.build_system == 'maven'
+        uses: s4u/setup-maven-action@v1.18.0
+        with:
+          checkout-enabled: false # Do not checkout internally
+          java-version: 11
+
+      - name: Setup Gradle Action
+        if: steps.detect.outputs.build_system == 'gradle'
+        uses: spring-io/spring-gradle-build-action@v2
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Create settings.xml
+        if: steps.detect.outputs.build_system == 'maven'
+        run: echo "${{ vars.MAVEN_SETTINGS_XML }}" | base64 -d > settings.xml
+
+      - name: Create artifactory-init.gradle
+        if: steps.detect.outputs.build_system == 'gradle'
+        run: |
+          mkdir -p gradle
+          echo "${{ vars.ARTIFACTORY_INIT_GRADLE }}" | base64 -d > gradle/artifactory-init.gradle
+
+      - name: Run Maven tests
+        if: steps.detect.outputs.build_system == 'maven'
+        run: mvn test
+
+      - name: Run Maven Build
+        if: steps.detect.outputs.build_system == 'maven'
+        run: mvn -B package -DskipTests --file pom.xml
+
+      - name: Run Gradle Build
+        if: steps.detect.outputs.build_system == 'gradle'
+        env:
+          ARTIFACTORY_USER: ${{ secrets.JFROG_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+          ARTIFACTORY_URL: https://${{ secrets.JFROG_HOST_NAME }}/artifactory
+          ARTIFACTORY_REPO: ${{ secrets.MAVEN_STAGING_ARTIFACTORY }}
+        run: ./gradlew clean build --init-script gradle/artifactory-init.gradle --no-daemon -PskipCheckExpectedBranchVersion --continue -x test
+
+      - name: Run Gradle tests
+        if: steps.detect.outputs.build_system == 'gradle'
+        run: ./gradlew test
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build_test
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
+    steps:
+    
+      - name: Check out code
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
+
+      - name: Detect build system
+        id: detect
+        run: |
+          if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+          else
+            echo "No supported build file found!" >&2
+            exit 1
+          fi
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }} # Value of the GPG private key to import
+          trust_level: 5  # optional, trust ultimately
+
+      - name: Setup Maven Action
+        if: steps.detect.outputs.build_system == 'maven'
+        uses: s4u/setup-maven-action@v1.18.0
+        with:
+          checkout-enabled: false # Do not checkout internally
+          java-version: 11
+
+      - name: Setup Gradle Action
+        if: steps.detect.outputs.build_system == 'gradle'
+        uses: spring-io/spring-gradle-build-action@v2
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Create settings.xml
+        if: steps.detect.outputs.build_system == 'maven'
+        run: echo "${{ vars.MAVEN_SETTINGS_XML }}" | base64 -d > settings.xml
+
+      - name: Create artifactory-publish.gradle
+        if: steps.detect.outputs.build_system == 'gradle'
+        run: |
+          mkdir -p gradle
+          echo "${{ vars.ARTIFACTORY_PUBLISH_GRADLE }}" | base64 -d > gradle/artifactory-publish.gradle
+
+      - name: Deploy Maven Artifacts to JFrog
+        if: steps.detect.outputs.build_system == 'maven'
+        env:
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+          JFROG_URL: https://${{ secrets.JFROG_HOST_NAME }}/artifactory/${{ secrets.MAVEN_STAGING_ARTIFACTORY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          mvn clean deploy org.apache.maven.plugins:maven-deploy-plugin:deploy -s settings.xml -DskipTests -DskipNexusStagingDeployMojo=true -DrepositoryId=fortknox-lineaje -Dartifactory_username=$JFROG_USERNAME -Dartifactory_password=$JFROG_PASSWORD -DaltDeploymentRepository=fortknox-lineaje::$JFROG_URL
+
+      - name: Deploy Gradle Artifacts to JFrog
+        if: steps.detect.outputs.build_system == 'gradle'
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          REPO_URL: https://github.com/${{ github.repository }}
+          ARTIFACTORY_USER: ${{ secrets.JFROG_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+          ARTIFACTORY_URL: https://${{ secrets.JFROG_HOST_NAME }}/artifactory
+          ARTIFACTORY_REPO: ${{ secrets.MAVEN_STAGING_ARTIFACTORY }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          ./gradlew publish --init-script gradle/artifactory-publish.gradle
+
+      - name: Install JFrog CLI
+        run: curl -fL https://install-cli.jfrog.io | sh
+
+      - name: Set CVE property in Artifactory for Maven Artifacts
+        if: steps.detect.outputs.build_system == 'maven'
+        run: |
+          # Avoid setting additional vcs properties so that only one callback is executed
+          export JFROG_CLI_CI_VCS_PROPS_DISABLED=true
+          mvn -q exec:exec -Dexec.executable=echo -Dexec.args='${project.groupId}:${project.artifactId}:${project.version}' | tee gav_ids.txt
+          gav_ids=$(cat gav_ids.txt | tr '\n' ' ')
+          for gav_id in ${gav_ids}
+          do
+            GROUP_PATH=$(echo ${gav_id} | awk -F ':' '{print $1}' | tr '.' '/')
+            ARTIFACT_ID=$(echo ${gav_id} | awk -F ':' '{print $2}')
+            VERSION=$(echo ${gav_id} | awk -F ':' '{print $3}')
+            jf rt sp "${{ secrets.MAVEN_STAGING_ARTIFACTORY }}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}/${ARTIFACT_ID}-${VERSION}.pom.asc" "fixed_cves=${{ github.event.inputs.fixed_cves }}" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token ${{ secrets.JFROG_PASSWORD }}
+          done
+
+      - name: Set CVE property in Artifactory for Gradle Artifacts
+        if: steps.detect.outputs.build_system == 'gradle'
+        run: |
+          # Avoid setting additional vcs properties so that only one callback is executed
+          export JFROG_CLI_CI_VCS_PROPS_DISABLED=true
+          gav_ids=$(./gradlew -q listPublications --init-script gradle/artifactory-publish.gradle | tr '\n' ' ')
+          for gav_id in ${gav_ids}
+          do
+            GROUP_PATH=$(echo ${gav_id} | awk -F ':' '{print $1}' | tr '.' '/')
+            ARTIFACT_ID=$(echo ${gav_id} | awk -F ':' '{print $2}')
+            VERSION=$(echo ${gav_id} | awk -F ':' '{print $3}')
+            jf rt sp "${{ secrets.MAVEN_STAGING_ARTIFACTORY }}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}/${ARTIFACT_ID}-${VERSION}.pom.asc" "fixed_cves=${{ github.event.inputs.fixed_cves }}" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token ${{ secrets.JFROG_PASSWORD }}
+          done
