@@ -24,6 +24,7 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
@@ -218,12 +219,97 @@ public class AbstractEmbeddingClientTest extends UnitFessTestCase {
         }
     }
 
+    // ========== availability-check hardening ==========
+
+    // BLOCKER regression pin: init() runs from the container's init-method assembler, whose
+    // RuntimeExceptions abort Tomcat context startup (LdiMethodUtil rethrows the cause raw ->
+    // ContainerInitFailureException -> LastaPrepareFilter). checkAvailabilityNow() reads operator
+    // configuration (e.g. OpenSearchEmbeddingClient.getModelId(), which rejects a malformed
+    // model.id with an EmbeddingException), so a single typo in fess_config.properties must not
+    // be able to stop Fess from booting. A failed probe means "unavailable", never "do not start".
+    @Test
+    public void test_init_doesNotPropagateAvailabilityFailure() {
+        final TestEmbeddingClient client = new TestEmbeddingClient();
+        client.setTestContentChunkerEnabled(true);
+        client.setTestAvailabilityCheckInterval(60);
+        client.setTestAvailabilityFailure(new EmbeddingException("Invalid content_chunker.embedding.opensearch.model.id: bad/id"));
+        try {
+            client.init();
+        } catch (final RuntimeException e) {
+            fail("init() must not propagate an availability-check failure -- it aborts container startup: " + e);
+        } finally {
+            client.destroy();
+        }
+        assertFalse(client.isAvailable(), "a client whose availability probe throws must report unavailable, not rethrow");
+    }
+
+    // isAvailable() is the read path used by EmbeddingClientManager.available() on every search
+    // request; it must degrade to false rather than propagate a configuration failure.
+    @Test
+    public void test_isAvailable_doesNotPropagateAvailabilityFailure() {
+        final TestEmbeddingClient client = new TestEmbeddingClient();
+        client.setTestAvailabilityFailure(new EmbeddingException("boom"));
+        try {
+            assertFalse(client.isAvailable(), "isAvailable() must report false when the probe throws, not rethrow");
+        } finally {
+            client.destroy();
+        }
+    }
+
+    // MAJOR perf pin: startAvailabilityCheck() early-returns while content chunking is disabled and
+    // is only ever called from init(), which runs once at postConstruct. Enabling the feature after
+    // boot therefore used to leave cachedAvailability null forever, making every
+    // EmbeddingClientManager.available() call pay a synchronous provider probe. isAvailable() must
+    // start (and memoize) the check on first use instead.
+    @Test
+    public void test_isAvailable_lazilyStartsCheckOnceWhenEnabledAfterInit() {
+        final TestEmbeddingClient client = new TestEmbeddingClient();
+        try {
+            client.init();
+            assertEquals(0, client.availabilityProbeCount(), "a disabled feature must not probe the provider at init()");
+
+            // Operator enables content_chunker.enabled after boot; no init() re-run happens because
+            // init() assigns httpClient before startAvailabilityCheck(), so getHttpClient() never
+            // lazily re-initializes.
+            client.setTestContentChunkerEnabled(true);
+            client.setTestAvailabilityCheckInterval(60);
+
+            for (int i = 0; i < 5; i++) {
+                assertTrue(client.isAvailable());
+            }
+            assertEquals(1, client.availabilityProbeCount(),
+                    "repeated isAvailable() calls must issue exactly one provider probe, not one per call");
+        } finally {
+            client.destroy();
+        }
+    }
+
     private static final class TestEmbeddingClient extends AbstractEmbeddingClient {
         private boolean overrideProxy = false;
         private String testProxyHost;
         private Integer testProxyPort;
         private String testProxyUsername;
         private String testProxyPassword;
+        private boolean testContentChunkerEnabled = false;
+        private int testAvailabilityCheckInterval = 0;
+        private RuntimeException testAvailabilityFailure;
+        private final AtomicInteger availabilityProbes = new AtomicInteger();
+
+        void setTestContentChunkerEnabled(final boolean enabled) {
+            this.testContentChunkerEnabled = enabled;
+        }
+
+        void setTestAvailabilityCheckInterval(final int interval) {
+            this.testAvailabilityCheckInterval = interval;
+        }
+
+        void setTestAvailabilityFailure(final RuntimeException failure) {
+            this.testAvailabilityFailure = failure;
+        }
+
+        int availabilityProbeCount() {
+            return availabilityProbes.get();
+        }
 
         void setTestProxy(final String host, final Integer port, final String username, final String password) {
             this.overrideProxy = true;
@@ -283,6 +369,10 @@ public class AbstractEmbeddingClientTest extends UnitFessTestCase {
 
         @Override
         protected boolean checkAvailabilityNow() {
+            availabilityProbes.incrementAndGet();
+            if (testAvailabilityFailure != null) {
+                throw testAvailabilityFailure;
+            }
             return true;
         }
 
@@ -293,12 +383,12 @@ public class AbstractEmbeddingClientTest extends UnitFessTestCase {
 
         @Override
         protected int getAvailabilityCheckInterval() {
-            return 0;
+            return testAvailabilityCheckInterval;
         }
 
         @Override
         protected boolean isContentChunkerEnabled() {
-            return false;
+            return testContentChunkerEnabled;
         }
 
         @Override

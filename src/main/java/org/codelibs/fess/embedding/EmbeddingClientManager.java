@@ -175,9 +175,22 @@ public class EmbeddingClientManager {
      *
      * @param texts the document/chunk texts to embed
      * @return the embedding vectors
-     * @throws EmbeddingException if the embedding client is not available or the call fails
+     * @throws EmbeddingException if any text is blank, the embedding client is not available, or the call fails
      */
     public List<float[]> embedDocuments(final List<String> texts) {
+        if (texts != null) {
+            for (final String text : texts) {
+                if (StringUtil.isBlank(text)) {
+                    // Symmetric with embedQuery's guard: no client filters blank elements, so a blank
+                    // chunk would be embedded into a meaningless vector, stored, and searched against.
+                    // Defensive rather than reachable from the stock pipeline -- LengthChunker.split
+                    // returns early on blank content and guarantees end > start -- but an externally
+                    // written content array replayed by extractExistingChunks, or a third-party
+                    // Chunker, can produce one.
+                    throw new EmbeddingException("Document text for embedding must not be blank");
+                }
+            }
+        }
         final EmbeddingClient client = getAvailableClient();
         return client.embedDocuments(texts);
     }
