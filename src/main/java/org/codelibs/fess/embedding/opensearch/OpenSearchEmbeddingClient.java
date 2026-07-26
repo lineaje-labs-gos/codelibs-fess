@@ -16,6 +16,8 @@
 package org.codelibs.fess.embedding.opensearch;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -25,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.classic.methods.HttpPost;
@@ -43,6 +46,7 @@ import org.apache.hc.core5.util.Timeout;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.codelibs.core.lang.StringUtil;
+import org.codelibs.fess.Constants;
 import org.codelibs.fess.embedding.AbstractEmbeddingClient;
 import org.codelibs.fess.embedding.EmbeddingException;
 import org.codelibs.fess.util.ComponentUtil;
@@ -145,6 +149,13 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
     protected static final String DEFAULT_QUERY_PREFIX = StringUtil.EMPTY;
 
     /**
+     * One-shot latch for the userinfo rejection reported by {@link #getApiUrl()}. That method runs
+     * on every availability probe (once per {@code availability.check.interval}) and on every embed
+     * batch, so the remedy is stated once per client instead of being smeared across the log.
+     */
+    private final AtomicBoolean userInfoRejectionLogged = new AtomicBoolean();
+
+    /**
      * Default constructor.
      */
     public OpenSearchEmbeddingClient() {
@@ -182,7 +193,7 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
             return false;
         }
         try {
-            final HttpGet request = new HttpGet(apiUrl + "/_plugins/_ml/models/" + modelId);
+            final HttpGet request = new HttpGet(createRequestUri(apiUrl + "/_plugins/_ml/models/" + modelId));
             try (var response = getHttpClient().execute(request)) {
                 final int statusCode = response.getCode();
                 if (statusCode < 200 || statusCode >= 300) {
@@ -391,7 +402,16 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
         if (StringUtil.isBlank(modelId)) {
             throw new EmbeddingException(getConfigPrefix() + "." + CONFIG_MODEL_ID + " is not configured");
         }
-        final String url = getApiUrl() + "/_plugins/_ml/models/" + modelId + "/_predict";
+        final String apiUrl = getApiUrl();
+        if (StringUtil.isBlank(apiUrl)) {
+            // getApiUrl() falls back all the way to DEFAULT_API_URL, so blank here means it
+            // refused the configured value; the remedy was already reported at ERROR.
+            throw new EmbeddingException(getConfigPrefix() + "." + CONFIG_API_URL + " is not usable");
+        }
+        final String url = apiUrl + "/_plugins/_ml/models/" + modelId + "/_predict";
+        // Parsed once, outside the retry loop: a syntactically invalid URL is a configuration
+        // error, not a transient one, and re-parsing it per attempt only repeats the failure.
+        final URI requestUri = createRequestUri(url);
         final Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("text_docs", texts);
         requestBody.put("return_number", true);
@@ -400,7 +420,7 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
         try {
             final String json = objectMapper.writeValueAsString(requestBody);
             return executeWithRetry(operation, () -> {
-                final HttpPost httpRequest = new HttpPost(url);
+                final HttpPost httpRequest = new HttpPost(requestUri);
                 httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
                 try (var response = getHttpClient().execute(httpRequest)) {
                     final int statusCode = response.getCode();
@@ -530,17 +550,49 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
      * stripping trailing slashes only, so callers can append fixed
      * {@code /_plugins/_ml/...} paths without producing duplicates.
      *
-     * @return the normalized API base URL
+     * <p><b>A userinfo-bearing URL is refused</b> ({@code http://user:password@host:9200}).
+     * RFC 9110 4.2.4 forbids generating the userinfo subcomponent in an {@code http}/{@code https}
+     * target URI, and httpclient5 enforces that unconditionally - {@code ProtocolExec} throws
+     * {@code ProtocolException("Request URI authority contains deprecated userinfo component")}
+     * before a connection is even attempted - so such a value is a non-functional configuration,
+     * not a deployment shape. Rather than probe it forever with the password sitting in every
+     * diagnostic, this method reports the remedy once at ERROR and returns blank, which makes
+     * {@link #checkAvailabilityNow()} report the provider unavailable. That is deliberately the
+     * <em>fail-closed</em> shape rather than a throw: {@link #init()} is the container's eager
+     * init-method, and a {@link RuntimeException} escaping it aborts Tomcat context startup - the
+     * exact way a malformed {@code model.id} once made Fess unbootable. Failing closed makes the
+     * pre-flight gate skip the run and leave documents pending, which is recoverable.</p>
+     *
+     * @return the normalized API base URL, or blank when the configured value was refused
      */
     protected String getApiUrl() {
         String url = getConfigString(CONFIG_API_URL, StringUtil.EMPTY);
+        String source = getConfigPrefix() + "." + CONFIG_API_URL;
         if (StringUtil.isBlank(url)) {
             url = SystemUtil.getSearchEngineHttpAddress();
+            source = Constants.FESS_SEARCH_ENGINE_HTTP_ADDRESS;
         }
         if (StringUtil.isBlank(url)) {
             url = DEFAULT_API_URL;
+            source = "the built-in default";
         }
-        return normalizeApiUrl(url);
+        final String normalized = normalizeApiUrl(url);
+        if (hasUserInfo(normalized)) {
+            if (userInfoRejectionLogged.compareAndSet(false, true)) {
+                // Names the source and the remedy, never the value: the whole point is that the
+                // value holds a credential.
+                logger.error(
+                        "[Embedding:OPENSEARCH] {} embeds credentials in the URL (a 'user:password@' userinfo component). "
+                                + "The HTTP client rejects that form unconditionally (RFC 9110 4.2.4 forbids sending it), so it can "
+                                + "never work; reporting the provider as unavailable so no run is started against it. Remove the "
+                                + "userinfo part and configure {}.{} / {}.{} for the OpenSearch cluster itself, or "
+                                + "http.proxy.username / http.proxy.password when the endpoint sits behind an authenticating proxy. "
+                                + "The rejected value is not logged.",
+                        source, getConfigPrefix(), CONFIG_USERNAME, getConfigPrefix(), CONFIG_PASSWORD);
+            }
+            return StringUtil.EMPTY;
+        }
+        return normalized;
     }
 
     /**
@@ -560,6 +612,70 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
             result = result.substring(0, result.length() - 1);
         }
         return result;
+    }
+
+    /**
+     * Builds the request URI without ever republishing the URL it was built from.
+     *
+     * <p>{@code new HttpGet(String)}/{@code new HttpPost(String)} delegate to
+     * {@link URI#create(String)}, whose {@link IllegalArgumentException} renders as
+     * {@code "<reason> at index N: <the whole input>"} over a {@link URISyntaxException} cause
+     * carrying the same text. The input here is derived from
+     * {@code content_chunker.embedding.opensearch.api.url}, an operator-supplied string that may
+     * carry credentials, so keeping either the message or the cause writes that value into
+     * {@code fess.log} and hands it to every upstream handler. Masking the rendered message is not
+     * a fix: a URL is unparseable precisely because it contains a character a masking pattern
+     * excludes, so the pattern stops matching exactly when it is needed.</p>
+     *
+     * <p>What survives is what is provably input-free: {@link URISyntaxException#getReason()} is
+     * one of {@code java.net.URI}'s parser constants ({@code "Illegal character in path"},
+     * {@code "Expected scheme name"}, ...), {@link URISyntaxException#getIndex()} is an int, and
+     * the configuration key name is a compile-time constant. The thrown exception carries no
+     * cause, so nothing downstream can walk back to the original text.</p>
+     *
+     * @param requestUrl the fully assembled request URL
+     * @return the parsed request URI
+     * @throws EmbeddingException if {@code requestUrl} is not a valid URI
+     */
+    protected URI createRequestUri(final String requestUrl) {
+        try {
+            return new URI(requestUrl);
+        } catch (final URISyntaxException e) {
+            throw new EmbeddingException("Cannot build a request URI from " + getConfigPrefix() + "." + CONFIG_API_URL + ": "
+                    + e.getReason() + " at index " + e.getIndex() + " (the value is withheld: it may contain credentials)");
+        }
+    }
+
+    /**
+     * Returns whether the authority of {@code url} carries a userinfo subcomponent, i.e. whether
+     * the URL embeds credentials as {@code scheme://user:password@host}.
+     *
+     * <p>Deliberately a textual scan rather than a parse. The values worth catching include the
+     * ones {@code java.net.URI} cannot parse at all (a raw space in the password, say), and those
+     * are exactly the ones a parse-based check would turn into a
+     * {@link URISyntaxException} whose message quotes the credential back. The authority is the
+     * span after {@code "://"} - or from the start when no scheme is present - up to the first
+     * {@code /}, {@code ?} or {@code #}, so an {@code @} in a path, query or fragment is not
+     * mistaken for userinfo, and a plain {@code host:port} never matches.</p>
+     *
+     * @param url the raw configured URL, possibly null or blank
+     * @return true when the authority contains an {@code @}
+     */
+    static boolean hasUserInfo(final String url) {
+        if (StringUtil.isBlank(url)) {
+            return false;
+        }
+        final int schemeEnd = url.indexOf("://");
+        final int authorityStart = schemeEnd >= 0 ? schemeEnd + 3 : 0;
+        int authorityEnd = url.length();
+        for (int i = authorityStart; i < url.length(); i++) {
+            final char c = url.charAt(i);
+            if (c == '/' || c == '?' || c == '#') {
+                authorityEnd = i;
+                break;
+            }
+        }
+        return authorityStart < authorityEnd && url.lastIndexOf('@', authorityEnd - 1) >= authorityStart;
     }
 
     /**

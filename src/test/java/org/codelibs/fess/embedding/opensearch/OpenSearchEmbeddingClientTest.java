@@ -15,8 +15,11 @@
  */
 package org.codelibs.fess.embedding.opensearch;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -1353,7 +1356,256 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
         }
     }
 
+    // ========== Credential safety of URL handling ==========
+    //
+    // A configured api.url is a credential-bearing string, and two independent
+    // paths used to republish it verbatim.
+    //
+    // (1) new HttpGet(String)/new HttpPost(String) delegate to URI.create, whose
+    //     IllegalArgumentException message is "<reason> at index N: <the whole
+    //     input>" over a URISyntaxException cause carrying the same text. Keeping
+    //     that throwable - logged with the event or hung off the EmbeddingException
+    //     as its cause - prints the URL into fess.log and hands it upstream.
+    //     Masking the message cannot fix this: a URL is unparseable precisely
+    //     because it contains a character the masking pattern excludes, so the
+    //     pattern stops matching.
+    // (2) A userinfo-bearing api.url (http://user:pass@host:9200) cannot work at
+    //     all - httpclient5's ProtocolExec rejects it unconditionally per RFC 9110
+    //     4.2.4 - so it is refused when the configuration is read, rather than
+    //     retried forever with the password sitting in every diagnostic.
+
+    /** Host substring that must never surface in a rendered exception or log event. */
+    private static final String SECRET_BEARING_HOST = "os.example.com";
+
+    /** A syntactically invalid URL (raw space) carrying no userinfo, isolating defect (1) from defect (2). */
+    private static final String UNPARSEABLE_API_URL = "http://" + SECRET_BEARING_HOST + ":9200/pa th";
+
+    /** A userinfo-bearing URL: non-functional configuration, and a credential in a log-prone string. */
+    private static final String USERINFO_API_URL = "http://opsadmin:pw@" + SECRET_BEARING_HOST + ":9200";
+
+    @Test
+    public void test_embedDocuments_unparseableApiUrl_exceptionCarriesNoUrl() {
+        client.setTestApiUrl(UNPARSEABLE_API_URL);
+        client.initHttpClient();
+        try {
+            client.embedDocuments(List.of("a"));
+            fail("expected EmbeddingException");
+        } catch (final EmbeddingException e) {
+            if (e.getCause() != null) {
+                fail("the URI parse failure must not be kept as a cause; it republishes the URL. cause=" + e.getCause().getClass().getName()
+                        + ": " + e.getCause().getMessage());
+            }
+            final String rendered = renderThrowable(e);
+            if (rendered.contains(SECRET_BEARING_HOST)) {
+                fail("rendered exception leaks the configured URL: " + rendered);
+            }
+            // The parser constants must survive - they are what makes the error actionable.
+            assertTrue(e.getMessage().contains("api.url"), "message should name the offending key: " + e.getMessage());
+            assertTrue(e.getMessage().contains("index"), "message should keep the parse index: " + e.getMessage());
+        }
+    }
+
+    @Test
+    public void test_embedDocuments_unparseableApiUrl_logsNoUrl() {
+        client.setTestApiUrl(UNPARSEABLE_API_URL);
+        client.initHttpClient();
+        final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
+        try {
+            client.embedDocuments(List.of("a"));
+            fail("expected EmbeddingException");
+        } catch (final EmbeddingException expected) {
+            // shape asserted by the sibling test
+        } finally {
+            capture.detach();
+        }
+        for (final String rendered : capture.renderedEvents()) {
+            if (rendered.contains(SECRET_BEARING_HOST)) {
+                fail("log event leaks the configured URL (message or attached throwable): " + rendered);
+            }
+        }
+    }
+
+    @Test
+    public void test_checkAvailabilityNow_unparseableApiUrl_reportsUnavailableWithoutLeaking() {
+        client.setTestApiUrl(UNPARSEABLE_API_URL);
+        client.initHttpClient();
+        final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
+        try {
+            assertFalse(client.checkAvailabilityNow());
+        } finally {
+            capture.detach();
+        }
+        // The probe deliberately reports which base URL it tried - that value is userinfo-free by
+        // construction (getApiUrl() refuses anything else). What must not appear is the parse
+        // failure's own rendering: the assembled request URI and the URI/IllegalArgument
+        // throwables, which quote the input verbatim regardless of what it contains.
+        for (final String rendered : capture.renderedEvents()) {
+            if (rendered.contains("/pa th/_plugins") || rendered.contains("URISyntaxException")
+                    || rendered.contains("IllegalArgumentException")) {
+                fail("availability probe republishes the URI parse failure: " + rendered);
+            }
+        }
+    }
+
+    @Test
+    public void test_hasUserInfo_detectsCredentialsWithoutParsing() {
+        assertTrue(OpenSearchEmbeddingClient.hasUserInfo("http://user:pass@host:9200"));
+        assertTrue(OpenSearchEmbeddingClient.hasUserInfo("http://user@host:9200"));
+        // Unparseable *and* credential-bearing. The scan is textual, so the userinfo is
+        // still seen; a parse-based check would throw here and leak the value instead.
+        assertTrue(OpenSearchEmbeddingClient.hasUserInfo("http://user:pa ss@host:9200"));
+        // No scheme: the whole leading segment is the authority candidate.
+        assertTrue(OpenSearchEmbeddingClient.hasUserInfo("user:pass@host:9200"));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo("https://search.example.com:9200"));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo("http://localhost:9200"));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo("http://[::1]:9200"));
+        // '@' outside the authority is not userinfo.
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo("http://host:9200/a@b"));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo("http://host:9200?q=a@b"));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo("http://host:9200#a@b"));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo(""));
+        assertFalse(OpenSearchEmbeddingClient.hasUserInfo(null));
+    }
+
+    @Test
+    public void test_getApiUrl_real_userInfoIsRefused() {
+        final FessConfig original = installFessConfigStub(USERINFO_API_URL);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
+        try {
+            final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+            assertEquals("", realClient.getApiUrl());
+            final List<String> errors = capture.errors();
+            assertEquals(1, errors.size(), "expected exactly one ERROR naming the remedy, got: " + errors);
+            final String error = errors.get(0);
+            assertTrue(error.contains("content_chunker.embedding.opensearch.username"),
+                    "should name the provider credential keys: " + error);
+            assertTrue(error.contains("http.proxy.username"), "should name the authenticating-proxy keys: " + error);
+            assertFalse(error.contains("opsadmin"), "must not echo the credential: " + error);
+            assertFalse(error.contains(SECRET_BEARING_HOST), "must not echo the rejected URL: " + error);
+        } finally {
+            capture.detach();
+            ComponentUtil.setFessConfig(original);
+        }
+    }
+
+    @Test
+    public void test_getApiUrl_real_userInfoErrorIsLoggedOncePerClient() {
+        final FessConfig original = installFessConfigStub(USERINFO_API_URL);
+        final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
+        try {
+            final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+            realClient.getApiUrl();
+            realClient.getApiUrl();
+            realClient.getApiUrl();
+            // getApiUrl() runs on every availability probe (every 60s) and on every embed
+            // batch; the remedy must be stated once, not smeared across the log forever.
+            assertEquals(1, capture.errors().size(), "expected a one-shot ERROR, got: " + capture.errors());
+        } finally {
+            capture.detach();
+            ComponentUtil.setFessConfig(original);
+        }
+    }
+
+    @Test
+    public void test_getApiUrl_real_portIsNotMistakenForUserInfo() {
+        final FessConfig original = installFessConfigStub("https://search.example.com:9200");
+        final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
+        try {
+            final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+            assertEquals("https://search.example.com:9200", realClient.getApiUrl());
+            assertTrue(capture.errors().isEmpty(), "a normal host:port URL must be untouched, got: " + capture.errors());
+        } finally {
+            capture.detach();
+            ComponentUtil.setFessConfig(original);
+        }
+    }
+
+    @Test
+    public void test_checkAvailabilityNow_real_userInfoApiUrl_reportsUnavailable() {
+        final FessConfig original =
+                installFessConfigStubWith(Map.of(API_URL_CONFIG_KEY, USERINFO_API_URL, MODEL_ID_CONFIG_KEY, TEST_MODEL_ID));
+        final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
+        final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+        try {
+            assertFalse(realClient.checkAvailabilityNow(), "a non-functional api.url must fail closed, not be probed");
+            assertEquals(1, capture.errors().size(), "expected the remedy ERROR, got: " + capture.errors());
+        } finally {
+            capture.detach();
+            realClient.destroy();
+            ComponentUtil.setFessConfig(original);
+        }
+    }
+
+    @Test
+    public void test_init_real_userInfoApiUrlDoesNotAbortStartup() {
+        // Same BLOCKER shape as test_init_invalidModelId: init() is the container's eager
+        // init-method, so a rejected api.url must fail closed, never propagate.
+        final FessConfig original =
+                installFessConfigStubWith(Map.of(API_URL_CONFIG_KEY, USERINFO_API_URL, MODEL_ID_CONFIG_KEY, TEST_MODEL_ID));
+        final String oldEnabled = ComponentUtil.getSystemProperties().getProperty(CONTENT_CHUNKER_ENABLED_KEY);
+        ComponentUtil.getSystemProperties().setProperty(CONTENT_CHUNKER_ENABLED_KEY, "true");
+        final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+        try {
+            realClient.init();
+        } catch (final RuntimeException e) {
+            fail("a userinfo-bearing api.url must not propagate out of init() and abort container startup: " + e);
+        } finally {
+            if (oldEnabled == null) {
+                ComponentUtil.getSystemProperties().remove(CONTENT_CHUNKER_ENABLED_KEY);
+            } else {
+                ComponentUtil.getSystemProperties().setProperty(CONTENT_CHUNKER_ENABLED_KEY, oldEnabled);
+            }
+        }
+        try {
+            assertFalse(realClient.isAvailable(), "a client with a userinfo-bearing api.url must report unavailable");
+        } finally {
+            realClient.destroy();
+            ComponentUtil.setFessConfig(original);
+        }
+    }
+
     // ========== helpers ==========
+
+    /** Renders a throwable and its whole cause chain the way a log layout would. */
+    private static String renderThrowable(final Throwable throwable) {
+        final StringWriter writer = new StringWriter();
+        try (PrintWriter printWriter = new PrintWriter(writer)) {
+            throwable.printStackTrace(printWriter);
+        }
+        return writer.toString();
+    }
+
+    /**
+     * Installs a FessConfig stub whose getOrDefault answers from {@code values} and falls
+     * back to the caller-supplied default for every other key. Differently named from
+     * {@link #installFessConfigStub(String)} so a {@code null} argument stays unambiguous.
+     */
+    private FessConfig installFessConfigStubWith(final Map<String, String> values) {
+        final FessConfig original = ComponentUtil.getFessConfig();
+        ComponentUtil.setFessConfig(new FessConfig.SimpleImpl() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public String getOrDefault(final String key, final String defaultValue) {
+                final String value = values.get(key);
+                return value != null ? value : defaultValue;
+            }
+
+            // SimpleImpl only backs the getters it is told about; the generated ones read a
+            // null ObjectiveProperties and NPE. buildHttpClient() -> configureProxy() calls
+            // both of these unconditionally, so a stub used with init() must answer them.
+            @Override
+            public String getHttpProxyHost() {
+                return null;
+            }
+
+            @Override
+            public Integer getHttpProxyPortAsInteger() {
+                return null;
+            }
+        });
+        return original;
+    }
 
     /** Takes the next recorded request with a timeout so a missing request fails fast instead of hanging the suite. */
     private static RecordedRequest takeRequest(final MockWebServer server) throws InterruptedException {
@@ -1585,6 +1837,22 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
 
         List<String> errors() {
             return messagesAt(Level.ERROR);
+        }
+
+        /**
+         * Renders every captured event the way an appender's layout would: the formatted
+         * message <em>and</em> the attached throwable's stack trace, cause chain included.
+         *
+         * <p>Asserting only on {@link #messagesAt(Level)} is a trap for credential leaks:
+         * a leak carried by {@code logger.warn(pattern, args, throwable)} lives entirely in
+         * {@link LogEvent#getThrown()}, so a message-only assertion goes green while the
+         * rendered log line still prints the offending value.</p>
+         */
+        List<String> renderedEvents() {
+            return events.stream().map(e -> {
+                final Throwable thrown = e.getThrown();
+                return e.getMessage().getFormattedMessage() + (thrown != null ? System.lineSeparator() + renderThrowable(thrown) : "");
+            }).toList();
         }
     }
 }
