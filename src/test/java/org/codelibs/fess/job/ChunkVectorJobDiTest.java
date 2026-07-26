@@ -16,22 +16,46 @@
 package org.codelibs.fess.job;
 
 import org.codelibs.fess.unit.UnitFessTestCase;
-import org.codelibs.fess.util.ComponentUtil;
 import org.junit.jupiter.api.Test;
+import org.lastaflute.di.core.ComponentDef;
+import org.lastaflute.di.core.LaContainer;
+import org.lastaflute.di.core.factory.LaContainerFactory;
 
+/**
+ * Verifies the shipped {@code fess_job.xml} really declares {@code chunkVectorJob}: the scheduled
+ * job "Content Chunk Vector Indexer" resolves it by name via
+ * {@code container.getComponent("chunkVectorJob")}, so a missing declaration breaks the job at
+ * runtime only.
+ *
+ * <p>The test builds a container from the production resource instead of asserting through
+ * {@code ComponentUtil}: {@code UnitFessTestCase} boots from {@code test_app.xml}, which never
+ * includes {@code fess_job.xml}, so a container-level lookup would only prove that the test
+ * fixture declares the component.</p>
+ */
 public class ChunkVectorJobDiTest extends UnitFessTestCase {
 
+    private static final String JOB_XML = "fess_job.xml";
+
+    private static final String COMPONENT_NAME = "chunkVectorJob";
+
     @Test
-    public void test_chunkVectorJobRegisteredInFessJobXml() {
-        assertTrue(ComponentUtil.hasComponent("chunkVectorJob"), "chunkVectorJob component should be registered directly in fess_job.xml");
-        final Object job = ComponentUtil.getComponent("chunkVectorJob");
-        assertTrue(job instanceof ChunkVectorJob, "resolved component should be a ChunkVectorJob instance");
+    public void test_chunkVectorJobDeclaredInFessJobXml() {
+        final LaContainer container = LaContainerFactory.create(JOB_XML);
+        assertTrue(container.hasComponentDef(COMPONENT_NAME), COMPONENT_NAME + " must be declared in " + JOB_XML);
+        final ComponentDef componentDef = container.getComponentDef(COMPONENT_NAME);
+        assertEquals(ChunkVectorJob.class, componentDef.getComponentClass());
     }
 
     @Test
-    public void test_chunkVectorJobIsPrototypeScoped() {
-        final ChunkVectorJob first = ComponentUtil.getComponent("chunkVectorJob");
-        final ChunkVectorJob second = ComponentUtil.getComponent("chunkVectorJob");
+    public void test_chunkVectorJobIsPrototypeScopedInFessJobXml() {
+        final LaContainer container = LaContainerFactory.create(JOB_XML);
+        assertEquals(COMPONENT_NAME + " must be instance=\"prototype\" in " + JOB_XML, "prototype",
+                container.getComponentDef(COMPONENT_NAME).getInstanceDef().getName());
+        // a job instance carries per-run state (sessionId, jvmOptions, ...), so every lookup by
+        // the scheduler has to hand back a fresh instance
+        final Object first = container.getComponent(COMPONENT_NAME);
+        final Object second = container.getComponent(COMPONENT_NAME);
+        assertTrue(first instanceof ChunkVectorJob, "resolved component should be a ChunkVectorJob instance");
         assertTrue(first != second, "instance=\"prototype\" should yield a fresh instance per lookup");
     }
 }

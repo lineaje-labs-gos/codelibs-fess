@@ -184,56 +184,29 @@ public class ChunkVectorJobTest extends UnitFessTestCase {
         assertFalse(chunkVectorJob.processTimeout);
     }
 
-    // Test executeChunkVectorIndexer with Windows environment
+    // The only OS-dependent behaviour of executeChunkVectorIndexer is the classpath separator
+    // (";" on Windows, ":" elsewhere). It is driven by SystemUtils.IS_OS_WINDOWS, a static final
+    // frozen in commons-lang3's <clinit>, so System.setProperty("os.name", ...) inside a test
+    // cannot flip the branch: the former _windows/_unix pair asserted the same OS-independent
+    // thing twice. This asserts the separator actually used against the host's real one.
     @Test
-    public void test_executeChunkVectorIndexer_windows() {
+    public void test_executeChunkVectorIndexer_classpathSeparatorMatchesHost() {
         createRequiredDirectories();
-        // Restore (not clear) os.name afterwards: clearing it poisons later
-        // OpenSearch static initializers that read the property.
-        String originalOsName = System.getProperty("os.name");
-        System.setProperty("os.name", "Windows 10");
 
         mockProcessHelper.setExitValue(0);
-        mockProcessHelper.setOutput("Windows execution");
+        mockProcessHelper.setOutput("Success");
 
-        try {
-            chunkVectorJob.executeChunkVectorIndexer();
-        } catch (Exception e) {
-            // May fail in test environment
-        } finally {
-            System.setProperty("os.name", originalOsName);
-        }
+        chunkVectorJob.executeChunkVectorIndexer();
 
         List<String> cmdList = mockProcessHelper.getLastCommandList();
-        if (cmdList != null && cmdList.size() > 0) {
-            assertTrue(cmdList.contains("-cp") || cmdList.contains("-classpath"));
-        }
-    }
-
-    // Test executeChunkVectorIndexer with Unix environment
-    @Test
-    public void test_executeChunkVectorIndexer_unix() {
-        createRequiredDirectories();
-        // Restore (not clear) os.name afterwards: clearing it poisons later
-        // OpenSearch static initializers that read the property.
-        String originalOsName = System.getProperty("os.name");
-        System.setProperty("os.name", "Linux");
-
-        mockProcessHelper.setExitValue(0);
-        mockProcessHelper.setOutput("Unix execution");
-
-        try {
-            chunkVectorJob.executeChunkVectorIndexer();
-        } catch (Exception e) {
-            // May fail in test environment
-        } finally {
-            System.setProperty("os.name", originalOsName);
-        }
-
-        List<String> cmdList = mockProcessHelper.getLastCommandList();
-        if (cmdList != null && cmdList.size() > 0) {
-            assertTrue(cmdList.contains("-cp") || cmdList.contains("-classpath"));
-        }
+        assertNotNull(cmdList);
+        int cpIndex = cmdList.indexOf("-cp");
+        assertTrue("Should have -cp argument", cpIndex >= 0);
+        String classpath = cmdList.get(cpIndex + 1);
+        String chunkResources = "WEB-INF" + File.separator + "env" + File.separator + "chunk" + File.separator + "resources";
+        String webInfClasses = "WEB-INF" + File.separator + "classes";
+        assertTrue("Classpath entries must be joined by the host classpath separator: " + classpath,
+                classpath.contains(chunkResources + File.pathSeparator + webInfClasses));
     }
 
     // Test executeChunkVectorIndexer with custom config properties
@@ -248,20 +221,21 @@ public class ChunkVectorJobTest extends UnitFessTestCase {
 
         try {
             chunkVectorJob.executeChunkVectorIndexer();
-        } catch (Exception e) {
-            // May fail in test environment
         } finally {
             System.clearProperty(Constants.FESS_CONF_PATH);
         }
 
         List<String> cmdList = mockProcessHelper.getLastCommandList();
-        if (cmdList != null) {
-            int cpIndex = cmdList.indexOf("-cp");
-            if (cpIndex >= 0 && cpIndex + 1 < cmdList.size()) {
-                String classpath = cmdList.get(cpIndex + 1);
-                assertTrue(classpath.contains(confPath));
-            }
-        }
+        assertNotNull(cmdList);
+        int cpIndex = cmdList.indexOf("-cp");
+        assertTrue("Should have -cp argument", cpIndex >= 0);
+        String classpath = cmdList.get(cpIndex + 1);
+        assertTrue("fess.conf.path must be prepended to the child classpath: " + classpath,
+                classpath.startsWith(confPath + File.pathSeparator)
+                        || classpath.contains(File.pathSeparator + confPath + File.pathSeparator));
+        // and it must also be handed to the child JVM as a system property
+        assertTrue("Command list should contain -D" + Constants.FESS_CONF_PATH,
+                cmdList.contains("-D" + Constants.FESS_CONF_PATH + "=" + confPath));
     }
 
     // Test executeChunkVectorIndexer with local Fesen
@@ -276,16 +250,14 @@ public class ChunkVectorJobTest extends UnitFessTestCase {
 
         try {
             chunkVectorJob.executeChunkVectorIndexer();
-        } catch (Exception e) {
-            // May fail in test environment
         } finally {
             System.clearProperty(Constants.FESS_SEARCH_ENGINE_HTTP_ADDRESS);
         }
 
         List<String> cmdList = mockProcessHelper.getLastCommandList();
-        if (cmdList != null) {
-            assertTrue(cmdList.contains("-D" + Constants.FESS_SEARCH_ENGINE_HTTP_ADDRESS + "=http://localhost:9200"));
-        }
+        assertNotNull(cmdList);
+        assertTrue("Command list should pass the local search engine address to the child JVM",
+                cmdList.contains("-D" + Constants.FESS_SEARCH_ENGINE_HTTP_ADDRESS + "=http://localhost:9200"));
     }
 
     // Test executeChunkVectorIndexer command assembly: main class, process marker and session id
@@ -347,12 +319,14 @@ public class ChunkVectorJobTest extends UnitFessTestCase {
 
         try {
             chunkVectorJob.executeChunkVectorIndexer();
-            // In test environment, exception handling may vary
+            fail("a failing process launch must surface as JobProcessingException");
         } catch (JobProcessingException e) {
-            assertTrue(e.getMessage().contains("ChunkVectorIndexer Process terminated"));
-        } catch (Exception e) {
-            // May throw different exception in test environment
-            assertNotNull(e);
+            assertTrue("Unexpected message: " + e.getMessage(), e.getMessage().contains("ChunkVectorIndexer Process terminated"));
+            assertNotNull(e.getCause());
+        } finally {
+            // MockProcessHelper sets the interrupt flag when it replays an InterruptedException;
+            // leaving it set would leak into later tests in this JVM
+            Thread.interrupted();
         }
     }
 
