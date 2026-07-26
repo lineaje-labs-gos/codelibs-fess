@@ -159,7 +159,7 @@ public interface FessConfig extends FessEnv, org.codelibs.fess.mylasta.direction
      * -Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager<br>
      * -server<br>
      * -Xms128m<br>
-     * -Xmx256m<br>
+     * -Xmx1g<br>
      * -XX:MaxMetaspaceSize=128m<br>
      * -XX:CompressedClassSpaceSize=32m<br>
      * -XX:-UseGCOverheadLimit<br>
@@ -2495,7 +2495,7 @@ public interface FessConfig extends FessEnv, org.codelibs.fess.mylasta.direction
      * -Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager<br>
      * -server<br>
      * -Xms128m<br>
-     * -Xmx256m<br>
+     * -Xmx1g<br>
      * -XX:MaxMetaspaceSize=128m<br>
      * -XX:CompressedClassSpaceSize=32m<br>
      * -XX:-UseGCOverheadLimit<br>
@@ -14019,7 +14019,7 @@ public interface FessConfig extends FessEnv, org.codelibs.fess.mylasta.direction
             defaultMap.put(FessConfig.JVM_SUGGEST_OPTIONS,
                     "-Djava.awt.headless=true\n-Dfile.encoding=UTF-8\n-Djna.nosys=true\n-Djdk.io.permissionsUseCanonicalPath=true\n-Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager\n-server\n-Xms128m\n-Xmx256m\n-XX:MaxMetaspaceSize=128m\n-XX:CompressedClassSpaceSize=32m\n-XX:-UseGCOverheadLimit\n-XX:+UseTLAB\n-XX:+DisableExplicitGC\n-XX:-HeapDumpOnOutOfMemoryError\n-XX:+UnlockExperimentalVMOptions\n-XX:+UseG1GC\n-XX:InitiatingHeapOccupancyPercent=45\n-XX:G1HeapRegionSize=1m\n-XX:MaxGCPauseMillis=60000\n-XX:G1NewSizePercent=5\n-XX:G1MaxNewSizePercent=30\n-Dio.netty.noUnsafe=true\n-Dio.netty.noKeySetOptimization=true\n-Dio.netty.recycler.maxCapacityPerThread=0\n-Dlog4j.shutdownHookEnabled=false\n-Dlog4j2.disable.jmx=true\n-Dlog4j2.formatMsgNoLookups=true\n-Dlog4j.skipJansi=true\n");
             defaultMap.put(FessConfig.JVM_CHUNK_OPTIONS,
-                    "-Djava.awt.headless=true\n-Dfile.encoding=UTF-8\n-Djna.nosys=true\n-Djdk.io.permissionsUseCanonicalPath=true\n-Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager\n-server\n-Xms128m\n-Xmx256m\n-XX:MaxMetaspaceSize=128m\n-XX:CompressedClassSpaceSize=32m\n-XX:-UseGCOverheadLimit\n-XX:+UseTLAB\n-XX:+DisableExplicitGC\n-XX:-HeapDumpOnOutOfMemoryError\n-XX:+UnlockExperimentalVMOptions\n-XX:+UseG1GC\n-XX:InitiatingHeapOccupancyPercent=45\n-XX:G1HeapRegionSize=1m\n-XX:MaxGCPauseMillis=60000\n-XX:G1NewSizePercent=5\n-XX:G1MaxNewSizePercent=30\n-Dio.netty.noUnsafe=true\n-Dio.netty.noKeySetOptimization=true\n-Dio.netty.recycler.maxCapacityPerThread=0\n-Dlog4j.shutdownHookEnabled=false\n-Dlog4j2.disable.jmx=true\n-Dlog4j2.formatMsgNoLookups=true\n-Dlog4j.skipJansi=true\n");
+                    "-Djava.awt.headless=true\n-Dfile.encoding=UTF-8\n-Djna.nosys=true\n-Djdk.io.permissionsUseCanonicalPath=true\n-Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager\n-server\n-Xms128m\n-Xmx1g\n-XX:MaxMetaspaceSize=128m\n-XX:CompressedClassSpaceSize=32m\n-XX:-UseGCOverheadLimit\n-XX:+UseTLAB\n-XX:+DisableExplicitGC\n-XX:-HeapDumpOnOutOfMemoryError\n-XX:+UnlockExperimentalVMOptions\n-XX:+UseG1GC\n-XX:InitiatingHeapOccupancyPercent=45\n-XX:G1HeapRegionSize=1m\n-XX:MaxGCPauseMillis=60000\n-XX:G1NewSizePercent=5\n-XX:G1MaxNewSizePercent=30\n-Dio.netty.noUnsafe=true\n-Dio.netty.noKeySetOptimization=true\n-Dio.netty.recycler.maxCapacityPerThread=0\n-Dlog4j.shutdownHookEnabled=false\n-Dlog4j2.disable.jmx=true\n-Dlog4j2.formatMsgNoLookups=true\n-Dlog4j.skipJansi=true\n");
             defaultMap.put(FessConfig.JVM_THUMBNAIL_OPTIONS,
                     "-Djava.awt.headless=true\n-Dfile.encoding=UTF-8\n-Djna.nosys=true\n-Djdk.io.permissionsUseCanonicalPath=true\n-Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager\n-server\n-Xms128m\n-Xmx256m\n-XX:MaxMetaspaceSize=128m\n-XX:CompressedClassSpaceSize=32m\n-XX:-UseGCOverheadLimit\n-XX:+UseTLAB\n-XX:+DisableExplicitGC\n-XX:-HeapDumpOnOutOfMemoryError\n-XX:-OmitStackTraceInFastThrow\n-XX:+UnlockExperimentalVMOptions\n-XX:+UseG1GC\n-XX:InitiatingHeapOccupancyPercent=45\n-XX:G1HeapRegionSize=4m\n-XX:MaxGCPauseMillis=60000\n-XX:G1NewSizePercent=5\n-XX:G1MaxNewSizePercent=50\n-Djcifs.smb.client.responseTimeout=30000\n-Djcifs.smb.client.soTimeout=35000\n-Djcifs.smb.client.connTimeout=60000\n-Djcifs.smb.client.sessionTimeout=60000\n-Djcifs.smb1.smb.client.connTimeout=60000\n-Djcifs.smb1.smb.client.soTimeout=35000\n-Djcifs.smb1.smb.client.responseTimeout=30000\n-Dio.netty.noUnsafe=true\n-Dio.netty.noKeySetOptimization=true\n-Dio.netty.recycler.maxCapacityPerThread=0\n-Dlog4j.shutdownHookEnabled=false\n-Dlog4j2.disable.jmx=true\n-Dlog4j2.formatMsgNoLookups=true\n-Dlog4j.skipJansi=true\n-Dsun.java2d.cmm=sun.java2d.cmm.kcms.KcmsServiceProvider\n-Dorg.apache.pdfbox.rendering.UsePureJavaCMYKConversion=true\n");
             defaultMap.put(FessConfig.JOB_SYSTEM_JOB_IDS, "default_crawler");
