@@ -182,14 +182,25 @@ public class DefaultChatContentFetcher implements ChatContentFetcher {
     }
 
     /**
-     * Checks whether a document is a chunked document -- one whose {@code content} field holds a
-     * chunk array rather than a raw string. Matches both chunk statuses: {@link Constants#DONE}
+     * Checks whether a document is treated as a chunked document -- eligible for the chunk-selection
+     * pass in {@link #applyChunkSelection}. Matches both chunk statuses: {@link Constants#DONE}
      * (chunks with vectors) and {@link Constants#CHUNKED} (chunks written without vectors, e.g.
-     * when embedding is configured off). Statuses {@code skipped}/{@code fail} -- and an absent
-     * status -- mean the {@code content} field is a raw string, so they are not chunked here.
+     * when embedding is configured off).
+     *
+     * <p>{@code skipped}, an absent status, and {@code fail} are deliberately treated as unchunked.
+     * For {@code skipped}/absent that also means the {@code content} field is a raw string. For
+     * {@code fail} it does NOT: {@code ChunkVectorHelper#handleFailure} writes the failure status
+     * onto the document it originally fetched, and on the {@code chunked} -&gt; {@code done} upgrade
+     * path (which {@code ChunkVectorHelper#buildPendingQuery} deliberately re-selects on embedding
+     * runs) that document already carries a chunk-array {@code content} written by
+     * {@code storeChunkOnlyDocument}. So a {@code fail} document CAN carry an array
+     * {@code content}, and it is intentionally excluded here: a document whose embedding run failed
+     * gets no chunk selection, and its array {@code content} is joined and bounded by
+     * {@link #truncateContent} (and by {@code AbstractLlmClient#getStringValue} downstream) rather
+     * than raising a {@code ClassCastException}.</p>
      *
      * @param doc the document map
-     * @return true if the document carries a chunk-array {@code content}
+     * @return true if the document is eligible for chunk selection
      */
     protected boolean isChunkedStatus(final Map<String, Object> doc) {
         final Object status = doc.get(Constants.CONTENT_CHUNK_STATUS_FIELD);
@@ -720,8 +731,10 @@ public class DefaultChatContentFetcher implements ChatContentFetcher {
                     .getDocumentListByDocIds(docIds.toArray(new String[0]), fields, OptionalThing.empty(),
                             SearchRequestParams.SearchRequestType.JSON);
         } catch (final Exception e) {
+            // This WARN is the only trace of the failure (the caller just sees an empty list), so
+            // pass the Throwable itself: a bare getMessage() is empty for e.g. an NPE.
             logger.warn("[RAG] Failed to fetch full content for docIds={}. error={}, elapsedTime={}ms", docIds, e.getMessage(),
-                    System.currentTimeMillis() - startTime);
+                    System.currentTimeMillis() - startTime, e);
             return Collections.emptyList();
         }
     }
@@ -779,8 +792,10 @@ public class DefaultChatContentFetcher implements ChatContentFetcher {
             }
             return normalizeHighlightedDocs(docs);
         } catch (final Exception e) {
+            // As in fetchFullContent: the caller only sees an empty list, so this WARN must carry
+            // the Throwable or the failure is undiagnosable.
             logger.warn("[RAG] Failed to fetch highlighted content for docIds={}. Falling back to full. error={}, elapsedTime={}ms", docIds,
-                    e.getMessage(), System.currentTimeMillis() - startTime);
+                    e.getMessage(), System.currentTimeMillis() - startTime, e);
             return Collections.emptyList();
         }
     }

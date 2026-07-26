@@ -183,18 +183,26 @@ public class ChatClient {
             final LlmChatResponse llmResponse = llmClientManager.generateAnswer(userMessage, answerDocs, historyForAnswer);
 
             final ChatMessage assistantMessage = ChatMessage.assistantMessage(llmResponse.getContent());
-            for (final Map<String, Object> doc : answerDocs) {
+            // The sources are built from the SEARCH-phase maps, not from answerDocs: content_title
+            // and content_description do not exist in the index (see fess_indices/fess/doc.json) --
+            // they are injected at render time by the rank-fusion searcher via
+            // ViewHelper#getContentDescription. fetchContentForAnswer re-reads documents through
+            // SearchHelper#getDocumentListByDocIds, a pure _source projection, so those keys can
+            // never come back and sources[].snippet would silently vanish from the API response.
+            // answerDocs stays the LLM answer context (that is the whole point of the fetch).
+            for (final Map<String, Object> doc : searchResults) {
                 populateUrlLink(doc);
             }
-            addSourcesToMessage(assistantMessage, answerDocs, contextPath, searchResult.getQueryId(), searchResult.getRequestedTime());
+            addSourcesToMessage(assistantMessage, searchResults, contextPath, searchResult.getQueryId(), searchResult.getRequestedTime());
             assistantMessage.setSearchQuery(finalSearchQuery);
 
             session.addMessage(assistantMessage);
 
-            logger.info("[RAG] Chat completed. sessionId={}, intent={}, sourcesCount={}, elapsedTime={}ms", session.getSessionId(),
-                    intentResult.getIntent(), answerDocs.size(), System.currentTimeMillis() - startTime);
+            logger.info("[RAG] Chat completed. sessionId={}, intent={}, sourcesCount={}, answerDocsCount={}, elapsedTime={}ms",
+                    session.getSessionId(), intentResult.getIntent(), searchResults.size(), answerDocs.size(),
+                    System.currentTimeMillis() - startTime);
 
-            return new ChatResult(session.getSessionId(), assistantMessage, answerDocs);
+            return new ChatResult(session.getSessionId(), assistantMessage, searchResults);
         } catch (final Exception e) {
             if (e instanceof LlmException) {
                 logger.warn("[RAG] LLM error during chat. sessionId={}, error={}", session.getSessionId(), e.getMessage());
@@ -953,9 +961,14 @@ public class ChatClient {
      * fetcher returns nothing, so an OpenSearch hiccup degrades to the previous behavior
      * rather than an empty context.</p>
      *
+     * <p>The returned maps are for the LLM answer context ONLY -- never for the API
+     * {@code sources[]}. They come back from a {@code _source} projection, so the render-time-only
+     * fields the sources need ({@code content_description}, {@code content_title}) are not in them.
+     * The caller builds its sources from the search-phase maps.</p>
+     *
      * @param searchResults the search result documents
      * @param query the final search query (may be null for the SUMMARY intent)
-     * @return the documents to build the answer context and sources from
+     * @return the documents to build the LLM answer context from
      */
     protected List<Map<String, Object>> fetchContentForAnswer(final List<Map<String, Object>> searchResults, final String query) {
         if (searchResults.isEmpty()) {
@@ -977,7 +990,11 @@ public class ChatClient {
         } catch (final Exception e) {
             // The fetcher is an enrichment step: a failure must degrade this chat to the raw
             // search-result content (previous behavior), not fail the whole request.
-            logger.warn("[RAG] Failed to fetch answer content; using raw search results. docIds={}, error={}", docIds, e.getMessage());
+            // DefaultChatContentFetcher already catches and degrades every engine-level failure
+            // internally, so reaching here means a programming error (NPE/CCE) in the fetcher --
+            // exactly the case where the stack trace is the entire diagnostic, so log the
+            // Throwable itself, not only its (possibly null) message.
+            logger.warn("[RAG] Failed to fetch answer content; using raw search results. docIds={}, error={}", docIds, e.getMessage(), e);
             return searchResults;
         }
     }

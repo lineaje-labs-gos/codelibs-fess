@@ -1372,6 +1372,122 @@ public class DefaultChatContentFetcherTest extends UnitFessTestCase {
         }
     }
 
+    // ===================================================================================
+    //                                        degrade catches must log the stack trace
+    //                                                                           =========
+    // fetchFullContent/fetchHighlightedContent swallow every failure and return an empty list, so
+    // the WARN they emit is the ONLY trace of the failure. A two-placeholder/two-argument
+    // logger.warn() drops the Throwable, leaving the operator with a bare getMessage() (empty for
+    // an NPE) and no stack trace at all.
+
+    /** Registers a {@code searchHelper} whose engine-touching methods always throw. */
+    private static void registerThrowingSearchHelper(final RuntimeException failure) {
+        org.codelibs.fess.util.ComponentUtil.register(new org.codelibs.fess.helper.SearchHelper() {
+            @Override
+            public List<Map<String, Object>> getDocumentListByDocIds(final String[] docIds, final String[] fields,
+                    final org.dbflute.optional.OptionalThing<org.codelibs.fess.mylasta.action.FessUserBean> userBean,
+                    final org.codelibs.fess.entity.SearchRequestParams.SearchRequestType searchRequestType) {
+                throw failure;
+            }
+
+            @Override
+            public void search(final org.codelibs.fess.entity.SearchRequestParams searchRequestParams,
+                    final org.codelibs.fess.entity.SearchRenderData data,
+                    final org.dbflute.optional.OptionalThing<org.codelibs.fess.mylasta.action.FessUserBean> userBean) {
+                throw failure;
+            }
+        }, "searchHelper");
+    }
+
+    /**
+     * Runs {@code body} with a WARN-capturing appender attached to the fetcher's logger and returns
+     * the first captured event whose formatted message contains {@code messageFragment}.
+     */
+    private static LogEvent captureWarn(final String appenderName, final String messageFragment, final Runnable body) {
+        final String loggerName = DefaultChatContentFetcher.class.getName();
+        final LoggerContext ctx = (LoggerContext) org.apache.logging.log4j.LogManager.getContext(false);
+        final org.apache.logging.log4j.core.config.LoggerConfig loggerCfg = ctx.getConfiguration().getLoggerConfig(loggerName);
+        final Level originalLevel = loggerCfg.getLevel();
+        final List<LogEvent> captured = new ArrayList<>();
+        final AbstractAppender listAppender =
+                new AbstractAppender(appenderName, null, PatternLayout.createDefaultLayout(), true, Property.EMPTY_ARRAY) {
+                    @Override
+                    public void append(final LogEvent event) {
+                        if (event.getLevel().isMoreSpecificThan(Level.WARN)) {
+                            captured.add(event.toImmutable());
+                        }
+                    }
+                };
+        listAppender.start();
+        loggerCfg.addAppender(listAppender, Level.WARN, null);
+        loggerCfg.setLevel(Level.WARN);
+        ctx.updateLoggers();
+        try {
+            body.run();
+            return captured.stream()
+                    .filter(e -> loggerName.equals(e.getLoggerName()))
+                    .filter(e -> e.getMessage().getFormattedMessage().contains(messageFragment))
+                    .findFirst()
+                    .orElse(null);
+        } finally {
+            loggerCfg.removeAppender(appenderName);
+            loggerCfg.setLevel(originalLevel);
+            ctx.updateLoggers();
+            listAppender.stop();
+        }
+    }
+
+    @Test
+    public void test_fetchFullContent_failureWarnCarriesStackTrace() {
+        registerThrowingSearchHelper(new IllegalStateException("full-fetch boom"));
+        final DefaultChatContentFetcher f = new DefaultChatContentFetcher();
+        final LogEvent warn = captureWarn("test-full-fetch-throwable-appender", "Failed to fetch full content", () -> {
+            assertTrue(f.fetchFullContent(List.of("a")).isEmpty(), "a failed full fetch must degrade to an empty list");
+        });
+        assertNotNull(warn, "the failure must be logged at WARN");
+        assertNotNull(warn.getThrown(), "the full-fetch WARN must carry the Throwable, not just its message");
+        assertEquals("full-fetch boom", warn.getThrown().getMessage());
+    }
+
+    @Test
+    public void test_fetchHighlightedContent_failureWarnCarriesStackTrace() {
+        registerQueryFieldConfig();
+        registerThrowingSearchHelper(new IllegalStateException("highlight boom"));
+        final DefaultChatContentFetcher f = new DefaultChatContentFetcher();
+        final LogEvent warn = captureWarn("test-highlight-throwable-appender", "Failed to fetch highlighted content", () -> {
+            assertTrue(f.fetchHighlightedContent(List.of("a"), "q").isEmpty(), "a failed highlight fetch must degrade to an empty list");
+        });
+        assertNotNull(warn, "the failure must be logged at WARN");
+        assertNotNull(warn.getThrown(), "the highlight-fetch WARN must carry the Throwable, not just its message");
+        assertEquals("highlight boom", warn.getThrown().getMessage());
+    }
+
+    // ===================================================================================
+    //                                       isChunkedStatus: status=fail is never chunked
+    //                                                                           =========
+
+    @Test
+    public void test_isChunkedStatus_failStatusIsUnchunkedEvenWithArrayContent() {
+        // ChunkVectorHelper#handleFailure writes content_chunk_status=fail onto the document it
+        // originally fetched. On the chunked->done upgrade path (buildPendingQuery deliberately
+        // re-selects status=chunked docs) that document ALREADY carries a chunk-array content
+        // written by storeChunkOnlyDocument, so a fail-status document with an array content is a
+        // designed, reachable state -- not an impossible one. It is deliberately treated as
+        // unchunked: no chunk selection runs, and truncateContent joins the array for the LLM.
+        final TestableFetcher f = new TestableFetcher();
+        final Map<String, Object> failedButChunked = new LinkedHashMap<>();
+        failedButChunked.put("doc_id", "a");
+        failedButChunked.put("content", new ArrayList<Object>(List.of("chunk-a", "chunk-b")));
+        failedButChunked.put(Constants.CONTENT_CHUNK_STATUS_FIELD, "fail");
+        assertFalse(f.isChunkedStatus(failedButChunked), "status=fail must not be treated as chunked");
+
+        // ...and the array content is still bounded by the same join-then-truncate guard: no CCE,
+        // the LLM just receives the whole (joined) chunk array as this document's content.
+        f.threshold = 10L;
+        f.truncateContent(failedButChunked, f.getFulltextThreshold());
+        assertEquals("chunk-a\n\nc", failedButChunked.get("content"));
+    }
+
     /**
      * {@code queryFieldConfig} is not wired in the minimal {@code test_app.xml} DI set; register a
      * real instance (and run its @PostConstruct init) so {@code SearchRequestParams#getResponseFields}
