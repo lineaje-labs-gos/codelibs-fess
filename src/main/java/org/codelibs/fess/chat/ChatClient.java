@@ -19,6 +19,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -343,7 +344,9 @@ public class ChatClient {
                             .collect(Collectors.toList());
                     final List<Map<String, Object>> fullDocs = fetchFullContent(docIds);
                     callback.onPhaseComplete(ChatPhaseCallback.PHASE_FETCH);
-                    sources = fullDocs;
+                    // fullDocs stays the LLM context; the sources are resolved back to the
+                    // search-phase maps, which alone carry content_description/content_title.
+                    sources = resolveSourcesFromSearchResults(fullDocs, urlResults);
                     if (logger.isDebugEnabled()) {
                         logger.debug("[RAG] Phase {} completed. docIds={}, fetchedCount={}, phaseElapsedTime={}ms",
                                 ChatPhaseCallback.PHASE_FETCH, docIds, fullDocs.size(), System.currentTimeMillis() - phaseStartTime);
@@ -487,7 +490,9 @@ public class ChatClient {
                         final List<Map<String, Object>> fullDocs = ComponentUtil.getChatContentFetcher()
                                 .fetchContent(new ChatContentRequest(evalResult.getRelevantDocIds(), searchResults, finalSearchQuery));
                         callback.onPhaseComplete(ChatPhaseCallback.PHASE_FETCH);
-                        sources = fullDocs;
+                        // fullDocs stays the LLM context; the sources are resolved back to the
+                        // search-phase maps, which alone carry content_description/content_title.
+                        sources = resolveSourcesFromSearchResults(fullDocs, searchResults);
 
                         if (logger.isDebugEnabled()) {
                             logger.debug("[RAG] Phase {} completed. docIds={}, fetchedCount={}, phaseElapsedTime={}ms",
@@ -997,6 +1002,52 @@ public class ChatClient {
             logger.warn("[RAG] Failed to fetch answer content; using raw search results. docIds={}, error={}", docIds, e.getMessage(), e);
             return searchResults;
         }
+    }
+
+    /**
+     * Resolves the API {@code sources[]} maps for a fetched (LLM-context) document list, by
+     * mapping every fetched document back to its search-phase map.
+     *
+     * <p>{@code content_title} and {@code content_description} do not exist in the index (see
+     * {@code fess_indices/fess/doc.json}); they are injected at render time by the rank-fusion
+     * searcher via {@code ViewHelper#getContentDescription}, as is {@code score}. The fetch phase
+     * re-reads documents through {@code SearchHelper#getDocumentListByDocIds} -- a pure
+     * {@code _source} projection -- or through a doc_id-restricted highlight search, so those keys
+     * are never present on the fetched maps. Publishing the fetched maps as {@code sources[]}
+     * therefore silently drops {@code snippet} (and {@code title}, for a document whose indexed
+     * {@code title} is blank) from the streaming API response.</p>
+     *
+     * <p>Only the maps are swapped: the fetched list keeps feeding the LLM answer context, so the
+     * chunk-selected {@code content} the fetcher produced is unaffected. The returned list keeps
+     * the fetched list's order and cardinality -- i.e. exactly the documents the fetch phase
+     * resolved, not every search hit -- and a fetched document with no search-phase counterpart
+     * (the evaluation phase is LLM-driven and could name a doc id outside the result set) keeps
+     * its fetched map, preserving the previous behavior for that document.</p>
+     *
+     * @param fetchedDocs the fetched (LLM-context) documents
+     * @param searchResults the search-phase result maps the fetch was derived from
+     * @return the source maps, in {@code fetchedDocs} order
+     */
+    protected List<Map<String, Object>> resolveSourcesFromSearchResults(final List<Map<String, Object>> fetchedDocs,
+            final List<Map<String, Object>> searchResults) {
+        if (fetchedDocs.isEmpty() || searchResults == null || searchResults.isEmpty()) {
+            return fetchedDocs;
+        }
+        final String docIdField = ComponentUtil.getFessConfig().getIndexFieldDocId();
+        final Map<String, Map<String, Object>> searchDocsByDocId = new HashMap<>();
+        for (final Map<String, Object> doc : searchResults) {
+            final Object docId = doc.get(docIdField);
+            if (docId instanceof String) {
+                searchDocsByDocId.putIfAbsent((String) docId, doc);
+            }
+        }
+        final List<Map<String, Object>> resolved = new ArrayList<>(fetchedDocs.size());
+        for (final Map<String, Object> fetchedDoc : fetchedDocs) {
+            final Object docId = fetchedDoc.get(docIdField);
+            final Map<String, Object> searchDoc = docId instanceof String ? searchDocsByDocId.get(docId) : null;
+            resolved.add(searchDoc != null ? searchDoc : fetchedDoc);
+        }
+        return resolved;
     }
 
     /**
