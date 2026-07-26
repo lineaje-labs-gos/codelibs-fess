@@ -118,4 +118,22 @@ public class ChunkerManager {
         }
         return chunker.split(content);
     }
+
+    /**
+     * Splits content using the configured chunker, producing at most {@code limit} chunks.
+     * Delegates to {@link Chunker#split(String, int)} so a chunker whose splitting is incremental
+     * stops <em>producing</em> chunks at the limit instead of materializing the whole list and
+     * discarding the excess.
+     *
+     * @param content the content to split
+     * @param limit the maximum number of chunks to produce
+     * @return the list of chunks (at most {@code limit} entries), or an empty list if no chunker is resolved
+     */
+    public List<String> split(final String content, final int limit) {
+        final Chunker chunker = getChunker();
+        if (chunker == null) {
+            return Collections.emptyList();
+        }
+        return chunker.split(content, limit);
+    }
 }

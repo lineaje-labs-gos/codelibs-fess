@@ -15,6 +15,9 @@
  */
 package org.codelibs.fess.helper;
 
+import java.io.InterruptedIOException;
+import java.net.SocketException;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -39,6 +42,7 @@ import org.codelibs.fess.opensearch.client.SearchEngineClientException;
 import org.codelibs.fess.util.ComponentUtil;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 
@@ -116,6 +120,28 @@ public class ChunkVectorHelper {
     protected static final int DEFAULT_JOB_MAX_DOCUMENTS_PER_RUN = 10000;
 
     /**
+     * System property key (default {@code false}) opting a run in to reprocessing documents a
+     * previous run marked {@code content_chunk_status="fail"}. Without it the {@code "fail"} status
+     * is terminal for this job: {@link #buildPendingQuery(boolean)} never selects it again and
+     * there is no attempt counter, so an operator who has fixed the root cause (a wrong model id,
+     * an undeployed model, a provider that was returning 500s) has no in-product way to retry
+     * short of a recrawl. Read live via {@code getSystemProperty}, like the feature's other keys,
+     * so it can be flipped for one run and flipped back.
+     */
+    protected static final String JOB_RETRY_FAILED_PROPERTY = "content_chunker.job.retry_failed";
+
+    /**
+     * Config key of the built-in OpenSearch embedding client's model id, quoted verbatim in the
+     * "provider not available" remediation message. Duplicated as a literal rather than read from
+     * {@code OpenSearchEmbeddingClient} (where it is assembled from a private prefix and suffix)
+     * purely so the operator-facing message can name it; pinned by a unit test.
+     */
+    protected static final String OPENSEARCH_MODEL_ID_PROPERTY = "content_chunker.embedding.opensearch.model.id";
+
+    /** Maximum number of frames {@link #isRetryableEmbeddingFailure(Throwable)} walks in a cause chain. */
+    private static final int MAX_CAUSE_CHAIN_DEPTH = 32;
+
+    /**
      * Default constructor.
      */
     public ChunkVectorHelper() {
@@ -135,7 +161,11 @@ public class ChunkVectorHelper {
      * <li><b>chunk-only</b> -- embedding is configured off ({@code content_chunker.embedding.name}
      * is {@code "none"}, or no matching embedding client is registered; probed quietly via
      * {@link #isEmbeddingConfigured()}): content is chunked and written back as an array with
-     * {@code content_chunk_status="chunked"}, and NO vector field is written.</li>
+     * {@code content_chunk_status="chunked"}, and NO vector field is written. In a stock build the
+     * "no client registered" half of that condition is unreachable -- {@code opensearchEmbeddingClient}
+     * is declared unconditionally in core's own DI -- so the only way to select chunk-only mode is
+     * {@code content_chunker.embedding.name=none}. Leaving the model id unset does NOT select it;
+     * that lands in the <b>skip</b> branch below, forever.</li>
      * <li><b>skip</b> -- embedding is configured but the provider's liveness ping fails right now
      * (a transient outage): the whole run is skipped so pending documents stay pending. A
      * transient outage must NEVER flip processing into chunk-only mode, which would rewrite the
@@ -187,13 +217,26 @@ public class ChunkVectorHelper {
         final boolean embeddingActive = isEmbeddingConfigured();
         if (embeddingActive) {
             if (!isEmbeddingClientAvailable()) {
-                // The embedding provider is configured but unreachable (a transient outage). Skip
-                // the whole run WITHOUT scrolling/fetching/processing so pending documents stay
-                // pending -- and, critically, do NOT fall back to chunk-only mode: a transient
-                // outage must never rewrite the corpus without vectors. Logged at WARN so a genuine
-                // outage is visible; the documents are retried once the provider recovers.
-                logger.warn("Embedding provider is not available; skipping chunk-vector processing to keep pending documents pending.");
-                return "Embedding provider is not available. Skipped.";
+                // The embedding provider is configured but unreachable. Skip the whole run WITHOUT
+                // scrolling/fetching/processing so pending documents stay pending -- and, critically,
+                // do NOT fall back to chunk-only mode: a transient outage must never rewrite the
+                // corpus without vectors. Logged at WARN so a genuine outage is visible; the
+                // documents are retried once the provider recovers.
+                //
+                // The message must NOT describe this as a transient outage only: the identical
+                // branch is taken forever by a PERMANENT misconfiguration -- content_chunker.enabled
+                // is true but the model id was never set, so checkAvailabilityNow() can never
+                // succeed -- and the operator sees this same line on every scheduled run with no
+                // hint of what to change. Name both remediations.
+                logger.warn(
+                        "[ChunkVector] The embedding provider is not available; skipping chunk-vector processing to keep pending "
+                                + "documents pending. If this repeats on every run it is a misconfiguration rather than a transient "
+                                + "outage: set {} to a deployed model, or set {}={} to run chunk-only mode (content is chunked and "
+                                + "marked \"{}\" without vectors).",
+                        OPENSEARCH_MODEL_ID_PROPERTY, AbstractEmbeddingClient.EMBEDDING_NAME_PROPERTY, Constants.NONE, Constants.CHUNKED);
+                return "Embedding provider is not available. Skipped. If this repeats on every run, it is a misconfiguration rather "
+                        + "than a transient outage: set " + OPENSEARCH_MODEL_ID_PROPERTY + " to a deployed model, or set "
+                        + AbstractEmbeddingClient.EMBEDDING_NAME_PROPERTY + "=" + Constants.NONE + " to run chunk-only mode.";
             }
             if (!checkDimensionConsistency()) {
                 // A confirmed embedding-dimension mismatch between the configured provider/model and
@@ -277,6 +320,13 @@ public class ChunkVectorHelper {
      * run probing this every execution stays quiet. Deliberately excludes availability: that
      * distinguishes "configured off" (chunk-only mode) from "configured but transiently down"
      * (skip the run). Overridable seam for tests.
+     *
+     * <p>Note that in a stock build the "no matching client is registered" half can never be false
+     * for the default name: {@code opensearchEmbeddingClient} is declared unconditionally in core's
+     * DI, so the only route into chunk-only mode is an explicit
+     * {@code content_chunker.embedding.name=none}. An install that enables chunking but never sets
+     * a model id therefore does NOT degrade to chunk-only -- it takes the availability-skip branch
+     * on every run.</p>
      *
      * @return true if an embedding client is configured and registered
      */
@@ -363,19 +413,42 @@ public class ChunkVectorHelper {
      * In chunk-only mode {@code "chunked"} documents are already in their terminal state for that
      * mode and must NOT be reprocessed every run.
      *
+     * <p>Documents a previous run marked {@code "fail"} are excluded by default -- reprocessing a
+     * genuine poison document every run would burn provider spend forever. They are included only
+     * when {@link #JOB_RETRY_FAILED_PROPERTY} is set, which is the operator's in-product way to
+     * retry after fixing the root cause (there is deliberately no attempt counter and no automatic
+     * retry). {@code "skipped"} is never reprocessed either way: it is a property of the document's
+     * current content, cleared by the next recrawl.</p>
+     *
      * @param embeddingActive whether embedding is active for this run
      * @return the query builder
      */
     protected QueryBuilder buildPendingQuery(final boolean embeddingActive) {
         final QueryBuilder statusAbsent =
                 QueryBuilders.boolQuery().mustNot(QueryBuilders.existsQuery(Constants.CONTENT_CHUNK_STATUS_FIELD));
-        if (!embeddingActive) {
+        final boolean retryFailed = isRetryFailedEnabled();
+        if (!embeddingActive && !retryFailed) {
             return statusAbsent;
         }
-        return QueryBuilders.boolQuery()
-                .should(statusAbsent)
-                .should(QueryBuilders.termQuery(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.CHUNKED))
-                .minimumShouldMatch(1);
+        final BoolQueryBuilder query = QueryBuilders.boolQuery().should(statusAbsent).minimumShouldMatch(1);
+        if (embeddingActive) {
+            query.should(QueryBuilders.termQuery(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.CHUNKED));
+        }
+        if (retryFailed) {
+            query.should(QueryBuilders.termQuery(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.FAIL));
+        }
+        return query;
+    }
+
+    /**
+     * Reports whether this run should also reprocess documents a previous run marked
+     * {@code content_chunk_status="fail"}, per {@link #JOB_RETRY_FAILED_PROPERTY} (default false).
+     * Read live so an operator can enable it for a single run and turn it back off.
+     *
+     * @return true if failed documents must be re-selected as pending
+     */
+    protected boolean isRetryFailedEnabled() {
+        return Boolean.parseBoolean(ComponentUtil.getFessConfig().getSystemProperty(JOB_RETRY_FAILED_PROPERTY, "false"));
     }
 
     /**
@@ -1019,6 +1092,12 @@ public class ChunkVectorHelper {
             // fixed-character-count splitting has no word-boundary awareness, so a separator
             // joined between chunks would frequently land mid-word. OpenSearch/Elasticsearch
             // text-type fields natively accept a JSON array value for the same field.
+            // content_length is deliberately NOT recomputed here: it holds the crawled resource's
+            // BYTE size (AbstractFessFileTransformer / FessXpathTransformer write
+            // responseData.getContentLength()) and is rendered as a file size by fe:formatFileSize,
+            // not the extracted text's character count. Chunking does not change the fetched
+            // resource's size, so summing chunk lengths here would corrupt a user-visible value and
+            // re-order every sort:content_length query.
             updatedDoc.put(fessConfig.getIndexFieldContent(), chunks);
             updatedDoc.put(Constants.CONTENT_CHUNK_VECTOR_FIELD, vectorList);
             updatedDoc.put(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.DONE);
@@ -1032,7 +1111,7 @@ public class ChunkVectorHelper {
             // processing run (executed by the ChunkVectorIndexer child process) and every
             // other caller rely on each document resolving to a plain boolean.
             try {
-                return handleFailure(searchEngineClient, fessConfig, doc, id);
+                return handleFailure(searchEngineClient, fessConfig, doc, id, e);
             } catch (final Exception inner) {
                 logger.warn("[ChunkVector] Failed to record failure state for document; giving up for this run. id={}", id, inner);
                 return false;
@@ -1066,19 +1145,28 @@ public class ChunkVectorHelper {
             }
             return null;
         }
-        final List<String> chunks = splitContent(content);
+        final int maxChunks = getMaxChunksPerDocument();
+        // Bound chunk PRODUCTION at maxChunks + 1, not just the post-hoc size check below: one more
+        // chunk than the cap is all that is needed to detect an over-cap document, and an over-cap
+        // document is going to be marked "skipped" with its content untouched anyway. Splitting it
+        // fully first would materialize a chunk list that is never used -- and BatchEntry retains
+        // each document's chunk list (plus its full _source, plus its vectors) for the whole batch,
+        // so with the shipped defaults (bulk_size=20 x concurrency=2) that waste is multiplied 40x
+        // inside the chunk-indexer child JVM's small heap.
+        final List<String> chunks = splitContent(content, maxChunks + 1);
         if (chunks.isEmpty()) {
             if (logger.isInfoEnabled()) {
                 logger.info("[ChunkVector] Chunker produced no chunks, skipping. id={}", id);
             }
             return null;
         }
-        final int maxChunks = getMaxChunksPerDocument();
         if (chunks.size() > maxChunks) {
+            // The exact chunk count is deliberately NOT reported: production stopped at the cap + 1,
+            // so it is unknown (and computing it would defeat the bound).
             logger.warn(
-                    "[ChunkVector] Document produced {} chunks, exceeding the {}={} cap; marking it skipped and leaving "
+                    "[ChunkVector] Document produced more than the {}={} chunk cap; marking it skipped and leaving "
                             + "its content intact for keyword search. Raise {} and recrawl to include it in semantic chunking. id={}",
-                    chunks.size(), MAX_CHUNKS_PER_DOCUMENT_PROPERTY, maxChunks, MAX_CHUNKS_PER_DOCUMENT_PROPERTY, id);
+                    MAX_CHUNKS_PER_DOCUMENT_PROPERTY, maxChunks, MAX_CHUNKS_PER_DOCUMENT_PROPERTY, id);
             return null;
         }
         return chunks;
@@ -1134,9 +1222,9 @@ public class ChunkVectorHelper {
      * {@code embeddingActive} (chunk-only mode: embedding configured off), each document's content
      * is chunked and written back as an array with {@code content_chunk_status="chunked"} and NO
      * vector field, and no embedding call is ever made; a per-document failure is marked
-     * {@code "fail"} immediately (the mid-run provider-outage leniency in
-     * {@link #handleFailure(SearchEngineClient, FessConfig, Map, String, boolean)} cannot apply --
-     * there is no provider involved whose transient outage could explain the failure).
+     * {@code "fail"} immediately (the mid-run provider-outage / retryable-failure leniency in
+     * {@link #handleFailure(SearchEngineClient, FessConfig, Map, String, boolean, Throwable)} cannot
+     * apply -- there is no provider involved whose transient failure could explain it).
      *
      * @param ids the OpenSearch document {@code _id}s to process as one batch
      * @param embeddingActive whether embedding is active for this run; false selects chunk-only mode
@@ -1186,7 +1274,7 @@ public class ChunkVectorHelper {
             } catch (final Exception e) {
                 logger.warn("[ChunkVector] Failed to process document. id={}", id, e);
                 try {
-                    results.put(id, handleFailure(searchEngineClient, fessConfig, doc, id, embeddingActive));
+                    results.put(id, handleFailure(searchEngineClient, fessConfig, doc, id, embeddingActive, e));
                 } catch (final Exception inner) {
                     logger.warn("[ChunkVector] Failed to record failure state for document; giving up for this run. id={}", id, inner);
                     results.put(id, false);
@@ -1259,7 +1347,7 @@ public class ChunkVectorHelper {
                 results.put(entry.id, storeChunkedDocument(searchEngineClient, fessConfig, entry, entry.vectors));
             } catch (final Exception e) {
                 logger.warn("[ChunkVector] Failed to store document after batch embedding. id={}", entry.id, e);
-                results.put(entry.id, recordFailure(searchEngineClient, fessConfig, entry, true));
+                results.put(entry.id, recordFailure(searchEngineClient, fessConfig, entry, true, e));
             }
         }
         return results;
@@ -1270,6 +1358,14 @@ public class ChunkVectorHelper {
      * {@code content_chunk_status="chunked"}: for such a document the stored content array
      * elements ARE the chunks, so an embedding-enabled run must embed them directly rather than
      * re-chunking (chunk boundaries could shift) or joining them back into one string.
+     *
+     * <p><b>Chunk boundaries are frozen once a document reaches a terminal status.</b> Nothing
+     * records which {@code content_chunker.length.chunk_size}/{@code overlap} produced the stored
+     * array, and this method returns it verbatim, so a later chunk-size change applies only to
+     * documents that are not yet {@code "chunked"}/{@code "done"}/{@code "skipped"}. Re-chunking an
+     * existing corpus requires a recrawl: re-indexing replaces {@code _source} wholesale, which
+     * restores a plain-string {@code content} and clears {@code content_chunk_status}, so the new
+     * boundaries do take effect for every re-crawled document.</p>
      *
      * @param fessConfig the fess config
      * @param doc the fetched document map
@@ -1313,12 +1409,18 @@ public class ChunkVectorHelper {
             final BatchEntry entry) {
         try {
             final Map<String, Object> updatedDoc = new HashMap<>(entry.doc);
+            // content_length is deliberately NOT recomputed here: it holds the crawled resource's
+            // BYTE size (AbstractFessFileTransformer / FessXpathTransformer write
+            // responseData.getContentLength()) and is rendered as a file size by fe:formatFileSize,
+            // not the extracted text's character count. Chunking does not change the fetched
+            // resource's size, so summing chunk lengths here would corrupt a user-visible value and
+            // re-order every sort:content_length query.
             updatedDoc.put(fessConfig.getIndexFieldContent(), entry.chunks);
             updatedDoc.put(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.CHUNKED);
             return storeSafely(searchEngineClient, fessConfig, updatedDoc, entry.id);
         } catch (final Exception e) {
             logger.warn("[ChunkVector] Failed to store chunk-only document. id={}", entry.id, e);
-            return recordFailure(searchEngineClient, fessConfig, entry, false);
+            return recordFailure(searchEngineClient, fessConfig, entry, false, e);
         }
     }
 
@@ -1365,7 +1467,7 @@ public class ChunkVectorHelper {
             return storeChunkedDocument(searchEngineClient, fessConfig, entry, vectors);
         } catch (final Exception e) {
             logger.warn("[ChunkVector] Failed to embed/store document individually after batch embedding failed. id={}", entry.id, e);
-            return recordFailure(searchEngineClient, fessConfig, entry, true);
+            return recordFailure(searchEngineClient, fessConfig, entry, true, e);
         }
     }
 
@@ -1393,6 +1495,12 @@ public class ChunkVectorHelper {
         // Mutate a COPY, never the shared entry.doc map -- see processDocument()'s identical rationale
         // for why the failure path must operate on the original fetch.
         final Map<String, Object> updatedDoc = new HashMap<>(entry.doc);
+        // content_length is deliberately NOT recomputed here: it holds the crawled resource's
+        // BYTE size (AbstractFessFileTransformer / FessXpathTransformer write
+        // responseData.getContentLength()) and is rendered as a file size by fe:formatFileSize,
+        // not the extracted text's character count. Chunking does not change the fetched
+        // resource's size, so summing chunk lengths here would corrupt a user-visible value and
+        // re-order every sort:content_length query.
         updatedDoc.put(fessConfig.getIndexFieldContent(), entry.chunks);
         updatedDoc.put(Constants.CONTENT_CHUNK_VECTOR_FIELD, vectorList);
         updatedDoc.put(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.DONE);
@@ -1401,8 +1509,8 @@ public class ChunkVectorHelper {
 
     /**
      * Records a per-document processing failure via
-     * {@link #handleFailure(SearchEngineClient, FessConfig, Map, String, boolean)} (its own CAS
-     * write), never letting handleFailure's own write failure escape --
+     * {@link #handleFailure(SearchEngineClient, FessConfig, Map, String, boolean, Throwable)} (its own
+     * CAS write), never letting handleFailure's own write failure escape --
      * {@link #processBatch(List, boolean)} must resolve every document to a plain boolean.
      *
      * @param searchEngineClient the search engine client
@@ -1410,12 +1518,13 @@ public class ChunkVectorHelper {
      * @param entry the batch entry whose failure is being recorded
      * @param embeddingActive whether embedding is active for this run (gates the mid-run
      *            provider-outage leniency in handleFailure)
+     * @param cause the exception that caused the failure (gates the retryable-failure leniency)
      * @return the result of handleFailure, or false if even that write failed
      */
     private boolean recordFailure(final SearchEngineClient searchEngineClient, final FessConfig fessConfig, final BatchEntry entry,
-            final boolean embeddingActive) {
+            final boolean embeddingActive, final Throwable cause) {
         try {
-            return handleFailure(searchEngineClient, fessConfig, entry.doc, entry.id, embeddingActive);
+            return handleFailure(searchEngineClient, fessConfig, entry.doc, entry.id, embeddingActive, cause);
         } catch (final Exception inner) {
             logger.warn("[ChunkVector] Failed to record failure state for document; giving up for this run. id={}", entry.id, inner);
             return false;
@@ -1500,51 +1609,132 @@ public class ChunkVectorHelper {
      * @param fessConfig the fess config
      * @param doc the document map read before the failure occurred
      * @param id the document ID
+     * @param cause the exception that caused the failure (may be null when unknown)
      * @return the result of {@link #storeSafely}
      */
     protected boolean handleFailure(final SearchEngineClient searchEngineClient, final FessConfig fessConfig, final Map<String, Object> doc,
-            final String id) {
-        return handleFailure(searchEngineClient, fessConfig, doc, id, true);
+            final String id, final Throwable cause) {
+        return handleFailure(searchEngineClient, fessConfig, doc, id, true, cause);
     }
 
     /**
-     * Mode-aware variant of {@link #handleFailure(SearchEngineClient, FessConfig, Map, String)}:
+     * Mode-aware variant of {@link #handleFailure(SearchEngineClient, FessConfig, Map, String, Throwable)}:
      * the mid-run provider-outage leniency (leave the document pending, no write) only applies
      * when embedding is active -- in chunk-only mode no embedding provider is involved, so a
      * transient provider outage can never explain a failure and every failure is a genuine
      * per-document one, marked {@code content_chunk_status="fail"} immediately.
+     *
+     * <p>The leniency is gated on TWO independent signals, either of which is sufficient:</p>
+     * <ul>
+     * <li>{@link #isEmbeddingClientAvailable()} is false -- the provider died mid-run, after
+     * {@link #executeChunkVectorProcessing()}'s pre-flight gate had already passed.</li>
+     * <li>the failure is rooted in a retryable transport/HTTP condition
+     * ({@link #isRetryableEmbeddingFailure(Throwable)}) even though availability still reports the
+     * provider up. This second signal is load-bearing, not belt-and-braces: the availability probe
+     * and the embedding call hit DIFFERENT endpoints. OpenSearch ML Commons answers
+     * {@code GET /_plugins/_ml/models/{id}} with {@code model_state=DEPLOYED} while {@code _predict}
+     * returns 500 under a tripped memory circuit breaker, so a sustained 5xx storm exhausts the
+     * client's small retry budget on every document with {@code available() == true}. Gating on
+     * availability alone would stamp the entire corpus {@code content_chunk_status="fail"} in one
+     * run -- a status the pending query then excludes on every subsequent run.</li>
+     * </ul>
+     *
+     * <p>A genuine per-document defect (a non-retryable HTTP 400, a count/dimension mismatch, an
+     * unparsable response) matches neither signal and is still marked failed immediately, so this
+     * never degenerates into retrying a poison document forever. When such a document IS marked
+     * failed by mistake, {@link #JOB_RETRY_FAILED_PROPERTY} is the operator's way back.</p>
      *
      * @param searchEngineClient the search engine client
      * @param fessConfig the fess config
      * @param doc the document map read before the failure occurred
      * @param id the document ID
      * @param embeddingActive whether embedding is active for this run
+     * @param cause the exception that caused the failure; null means "unknown", which is treated as
+     *            a genuine per-document failure (the conservative direction: it preserves the
+     *            terminal-status behaviour rather than looping)
      * @return the result of {@link #storeSafely}
      */
     protected boolean handleFailure(final SearchEngineClient searchEngineClient, final FessConfig fessConfig, final Map<String, Object> doc,
-            final String id, final boolean embeddingActive) {
-        if (embeddingActive && !isEmbeddingClientAvailable()) {
-            // The embedding provider is unreachable RIGHT NOW -- it died mid-run, after
-            // executeChunkVectorProcessing()'s pre-flight availability gate had already passed.
-            // Every pending document's embed call is now failing purely because of this transient
-            // outage, not because the document itself is unprocessable. Marking these outage
-            // failures would durably stamp the whole corpus content_chunk_status=fail (which
-            // the pending query then excludes forever, recoverable only by a full
-            // recrawl). Leave the document pending instead -- no status write, no CAS write at all --
-            // so it is retried unchanged once the provider recovers; the next run's pre-flight gate
-            // then skips the run entirely while the outage persists. A genuine poison document
-            // (HTTP 400, count/dimension mismatch) fails while the provider is still reachable, so
-            // available() is true and it still flows through the failure write below. Re-probing the
-            // same cached availability the pre-flight gate reads keeps the two gates consistent; the
-            // periodic refresher bounds how long the cache can lag a real outage.
-            if (logger.isInfoEnabled()) {
-                logger.info("[ChunkVector] Embedding provider is unavailable; leaving document pending without marking it failed. id={}",
-                        id);
+            final String id, final boolean embeddingActive, final Throwable cause) {
+        if (embeddingActive) {
+            if (!isEmbeddingClientAvailable()) {
+                // The embedding provider is unreachable RIGHT NOW -- it died mid-run, after
+                // executeChunkVectorProcessing()'s pre-flight availability gate had already passed.
+                // Every pending document's embed call is now failing purely because of this transient
+                // outage, not because the document itself is unprocessable. Marking these outage
+                // failures would durably stamp the whole corpus content_chunk_status=fail (which
+                // the pending query then excludes unless content_chunker.job.retry_failed is set).
+                // Leave the document pending instead -- no status write, no CAS write at all -- so it
+                // is retried unchanged once the provider recovers; the next run's pre-flight gate
+                // then skips the run entirely while the outage persists. Re-probing the same cached
+                // availability the pre-flight gate reads keeps the two gates consistent; the periodic
+                // refresher bounds how long the cache can lag a real outage.
+                if (logger.isInfoEnabled()) {
+                    logger.info(
+                            "[ChunkVector] Embedding provider is unavailable; leaving document pending without marking it failed. id={}",
+                            id);
+                }
+                return false;
             }
-            return false;
+            if (isRetryableEmbeddingFailure(cause)) {
+                // The provider still reports itself available (its liveness endpoint is not the
+                // endpoint that is failing), but this document failed on a retryable transport/HTTP
+                // condition that the client already retried to exhaustion. That is an environment
+                // failure, not a document defect: leave it pending.
+                if (logger.isInfoEnabled()) {
+                    logger.info("[ChunkVector] Retryable provider failure; leaving document pending without marking it failed. id={}", id,
+                            cause);
+                }
+                return false;
+            }
         }
         doc.put(Constants.CONTENT_CHUNK_STATUS_FIELD, Constants.FAIL);
         return storeSafely(searchEngineClient, fessConfig, doc, id);
+    }
+
+    /**
+     * Tests whether the given throwable (or any of its causes) is a retryable transport/HTTP
+     * condition -- i.e. an environment failure that says nothing about the document -- as opposed to
+     * a per-document defect.
+     *
+     * <p>Deliberately a POSITIVE test over a small set of shapes rather than "any
+     * {@link java.io.IOException}": {@code OpenSearchEmbeddingClient} also wraps an unparsable
+     * predict response in an {@code IOException}/{@code EmbeddingException}, and that IS a genuine
+     * defect which must reach the terminal {@code "fail"} status instead of being retried forever.
+     * Anything not recognised here falls through to the failure write, so an unrecognised shape
+     * keeps the pre-existing behaviour.</p>
+     *
+     * <p>The retryable-HTTP case is matched by class name, mirroring {@link #isVersionConflict}:
+     * the client's {@code RetryableHttpException} is package-private to
+     * {@code org.codelibs.fess.embedding.opensearch}, and it survives in the cause chain of the
+     * {@code IOException} that {@code executeWithRetry} throws once its attempts are exhausted. The
+     * name check inspects the exception's Java class, never crawl-controlled data, so it cannot be
+     * spoofed by document content. Socket/timeout/DNS failures are matched by type
+     * ({@link SocketException} covers {@code ConnectException} and hc5's {@code ConnectTimeoutException} /
+     * {@code HttpHostConnectException}; {@link InterruptedIOException} covers
+     * {@code SocketTimeoutException}).</p>
+     *
+     * @param t the throwable to inspect; null returns false
+     * @return true if the failure is rooted in a retryable transport/HTTP condition
+     */
+    protected boolean isRetryableEmbeddingFailure(final Throwable t) {
+        Throwable cur = t;
+        // Bounded walk: a malformed exception chain with a cycle longer than one frame must not
+        // spin here.
+        for (int depth = 0; cur != null && depth < MAX_CAUSE_CHAIN_DEPTH; depth++) {
+            if (cur.getClass().getName().endsWith("RetryableHttpException")) {
+                return true;
+            }
+            if (cur instanceof SocketException || cur instanceof InterruptedIOException || cur instanceof UnknownHostException) {
+                return true;
+            }
+            final Throwable next = cur.getCause();
+            if (next == cur) {
+                break;
+            }
+            cur = next;
+        }
+        return false;
     }
 
     /**
@@ -1720,13 +1910,29 @@ public class ChunkVectorHelper {
     }
 
     /**
-     * Splits content into chunks via {@link ChunkerManager}. Overridable seam for tests.
+     * Splits content into chunks via {@link ChunkerManager}, unbounded. Overridable seam for tests.
+     * The ingestion path itself always goes through {@link #splitContent(String, int)} so chunk
+     * production is bounded; this overload is retained as the plain delegate to
+     * {@link ChunkerManager#split(String)} and as the seam the bounded one builds on.
      *
      * @param content the document content
      * @return the list of chunks
      */
     protected List<String> splitContent(final String content) {
         return ComponentUtil.getComponent(ChunkerManager.class).split(content);
+    }
+
+    /**
+     * Splits content into at most {@code limit} chunks via {@link ChunkerManager#split(String, int)},
+     * so an oversized document stops <em>producing</em> chunks at the limit instead of materializing
+     * its full chunk list only for {@link #extractChunks} to discard it. Overridable seam for tests.
+     *
+     * @param content the document content
+     * @param limit the maximum number of chunks to produce
+     * @return the list of chunks, at most {@code limit} entries
+     */
+    protected List<String> splitContent(final String content, final int limit) {
+        return ComponentUtil.getComponent(ChunkerManager.class).split(content, limit);
     }
 
     /**

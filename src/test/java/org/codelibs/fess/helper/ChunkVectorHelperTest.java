@@ -15,6 +15,8 @@
  */
 package org.codelibs.fess.helper;
 
+import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -32,6 +34,7 @@ import org.apache.logging.log4j.core.Logger;
 import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.Property;
 import org.codelibs.fess.Constants;
+import org.codelibs.fess.embedding.EmbeddingException;
 import org.codelibs.fess.mylasta.direction.FessConfig;
 import org.codelibs.fess.opensearch.client.SearchEngineClient;
 import org.codelibs.fess.opensearch.client.SearchEngineClientException;
@@ -67,6 +70,7 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
         final FessConfig fessConfig = ComponentUtil.getFessConfig();
         if (fessConfig != null) {
             fessConfig.setSystemProperty(ChunkVectorHelper.MAX_CHUNKS_PER_DOCUMENT_PROPERTY, null);
+            fessConfig.setSystemProperty("content_chunker.job.retry_failed", null);
         }
         super.tearDown(testInfo);
     }
@@ -424,6 +428,50 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
                 stored.get("content"));
         assertFalse(stored.containsKey(Constants.CONTENT_CHUNK_VECTOR_FIELD), "an over-cap document must not persist any vectors");
         assertTrue(helper.embedCalls.isEmpty(), "an over-cap document must be skipped BEFORE any embedding call");
+    }
+
+    @Test
+    public void test_extractChunks_overCapDocument_stopsProducingChunksAtCapPlusOne() {
+        // A 10x oversized document is going to be marked "skipped" regardless, so its full chunk
+        // list must never be materialized: with the shipped defaults (bulk_size=20,
+        // concurrency=2, max_chunks_per_document=1000) a whole batch of such documents retains
+        // hundreds of megabytes of substrings in the chunk-indexer child JVM. Asking the chunker
+        // for cap+1 chunks is enough to detect "over cap".
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        fessConfig.setSystemProperty(ChunkVectorHelper.MAX_CHUNKS_PER_DOCUMENT_PROPERTY, "100");
+        final CountingSplitHelper counting = new CountingSplitHelper();
+        counting.availableChunks = 1000; // 10x the cap
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "oversized content");
+        searchEngineClient.documentToReturn = doc;
+
+        final boolean result = counting.processDocument("doc-1");
+
+        assertTrue(result, "an over-cap document must still be durably marked skipped");
+        assertEquals(Constants.SKIPPED, searchEngineClient.lastStoredDoc.get(Constants.CONTENT_CHUNK_STATUS_FIELD));
+        assertEquals("the split must be bounded at cap+1", 101, counting.lastSplitLimit);
+        assertEquals("chunk PRODUCTION must stop at cap+1 -- the full 1000-chunk list must never be materialized", 101,
+                counting.producedChunks);
+    }
+
+    @Test
+    public void test_extractChunks_underCapDocument_boundNeverTruncatesRealWork() {
+        // The bound must be cap+1, never cap: a document at exactly the cap must still be
+        // processed in full rather than mistaken for an over-cap one.
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        fessConfig.setSystemProperty(ChunkVectorHelper.MAX_CHUNKS_PER_DOCUMENT_PROPERTY, "5");
+        final CountingSplitHelper counting = new CountingSplitHelper();
+        counting.availableChunks = 5; // exactly the cap
+        counting.testVectors = List.of(new float[] { 1f }, new float[] { 2f }, new float[] { 3f }, new float[] { 4f }, new float[] { 5f });
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "at-cap content");
+        searchEngineClient.documentToReturn = doc;
+
+        assertTrue(counting.processDocument("doc-1"));
+        assertEquals(Constants.DONE, searchEngineClient.lastStoredDoc.get(Constants.CONTENT_CHUNK_STATUS_FIELD));
+        assertEquals("all five chunks must have been produced and stored", 5,
+                ((List<?>) searchEngineClient.lastStoredDoc.get("content")).size());
+        assertEquals(6, counting.lastSplitLimit);
     }
 
     @Test
@@ -837,6 +885,142 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
         assertFalse(results.get("doc-A"), "doc-A must stay pending during a provider outage");
         assertFalse(results.get("doc-B"), "doc-B must stay pending during a provider outage");
         assertEquals("no store may be attempted for any document during a provider outage", 0, searchEngineClient.storeCallCount);
+    }
+
+    // ===================================================================================
+    //                                        retryable provider failures must not stamp "fail"
+    //                                        ================================================
+    // The availability probe and the embedding call hit DIFFERENT endpoints: OpenSearch ML
+    // Commons' GET /_plugins/_ml/models/{id} keeps reporting model_state=DEPLOYED while _predict
+    // returns 500 under a tripped memory circuit breaker. The client's retry budget is exhausted
+    // in seconds, so every document in the run fails with available()==true and -- before this
+    // fix -- was stamped content_chunk_status="fail", which the pending query then excludes
+    // permanently. The FAIL write must therefore be gated on the EXCEPTION SHAPE, not only on the
+    // availability flag.
+
+    @Test
+    public void test_processDocument_retryExhaustedHttp500WhileProbeStillReportsAvailable_leavesDocumentPending() {
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "original content");
+        searchEngineClient.documentToReturn = doc;
+        helper.testChunks = List.of("chunk-a");
+        // available() is TRUE -- the model-state probe still says DEPLOYED. Only the _predict call
+        // is failing, and it failed with the exact shape OpenSearchEmbeddingClient produces once
+        // executeWithRetry() exhausts its attempts on a retryable status.
+        helper.testEmbeddingAvailable = true;
+        helper.testEmbedFailure = new EmbeddingException("Failed to call OpenSearch ML predict API",
+                new IOException("OpenSearch ML predict API retryable error: 500 Internal Server Error",
+                        new RetryableHttpException("retryable http error: 500 Internal Server Error")));
+
+        final boolean result = helper.processDocument("doc-1");
+
+        assertFalse(result, "a retryable provider failure must resolve to a pending skip, not a durably-recorded terminal state");
+        assertEquals("a retryable provider failure must write NO status -- the document must stay pending", 0,
+                searchEngineClient.storeCallCount);
+        assertNull(searchEngineClient.lastStoredDoc, "nothing may be persisted for a retryable provider failure");
+    }
+
+    @Test
+    public void test_processDocument_transportTimeoutWhileProbeStillReportsAvailable_leavesDocumentPending() {
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "original content");
+        searchEngineClient.documentToReturn = doc;
+        helper.testChunks = List.of("chunk-a");
+        helper.testEmbeddingAvailable = true;
+        helper.testEmbedFailure =
+                new EmbeddingException("Failed to call OpenSearch ML predict API", new SocketTimeoutException("Read timed out"));
+
+        final boolean result = helper.processDocument("doc-1");
+
+        assertFalse(result, "a transport timeout is transient, not a per-document defect");
+        assertEquals("a transport timeout must write no status", 0, searchEngineClient.storeCallCount);
+    }
+
+    @Test
+    public void test_processBatch_retryExhaustedHttp500WhileProbeStillReportsAvailable_leavesAllDocumentsPending() {
+        final Map<String, Object> docA = baseDoc();
+        docA.put("content", "content-A");
+        final Map<String, Object> docB = baseDoc();
+        docB.put("content", "content-B");
+        helper.testDocumentsById.put("doc-A", docA);
+        helper.testDocumentsById.put("doc-B", docB);
+        helper.testChunksByContent.put("content-A", List.of("a1"));
+        helper.testChunksByContent.put("content-B", List.of("b1"));
+        helper.testEmbeddingAvailable = true;
+        helper.testEmbedFailure = new EmbeddingException("Failed to call OpenSearch ML predict API",
+                new IOException("OpenSearch ML predict API retryable error: 503 Service Unavailable",
+                        new RetryableHttpException("retryable http error: 503 Service Unavailable")));
+
+        final Map<String, Boolean> results = helper.processBatch(List.of("doc-A", "doc-B"));
+
+        assertFalse(results.get("doc-A"), "doc-A must stay pending through a retryable provider storm");
+        assertFalse(results.get("doc-B"), "doc-B must stay pending through a retryable provider storm");
+        assertEquals("a retryable provider storm must not stamp any document failed", 0, searchEngineClient.storeCallCount);
+    }
+
+    @Test
+    public void test_processDocument_dimensionMismatchWhileProviderAvailable_stillMarksFailed() {
+        // Control for the gate above: a genuine per-document defect (the provider returned a
+        // wrong-length vector) must STILL be marked terminally failed -- the fix must not turn
+        // every failure into an infinite retry.
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "original content");
+        searchEngineClient.documentToReturn = doc;
+        helper.testChunks = List.of("chunk-a");
+        helper.testEmbeddingAvailable = true;
+        helper.testEmbedFailure = new EmbeddingException("OpenSearch ML predict vector dimension mismatch: expected=768, actual=384");
+
+        assertTrue(helper.processDocument("doc-1"), "the failure-path write must have been performed");
+        assertEquals(Constants.FAIL, searchEngineClient.lastStoredDoc.get(Constants.CONTENT_CHUNK_STATUS_FIELD));
+    }
+
+    @Test
+    public void test_processDocument_nonRetryableHttp400WhileProviderAvailable_stillMarksFailed() {
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "original content");
+        searchEngineClient.documentToReturn = doc;
+        helper.testChunks = List.of("chunk-a");
+        helper.testEmbeddingAvailable = true;
+        helper.testEmbedFailure = new EmbeddingException("OpenSearch ML predict API error: 400 Bad Request");
+
+        assertTrue(helper.processDocument("doc-1"), "the failure-path write must have been performed");
+        assertEquals(Constants.FAIL, searchEngineClient.lastStoredDoc.get(Constants.CONTENT_CHUNK_STATUS_FIELD));
+    }
+
+    @Test
+    public void test_processDocument_responseParseFailureWhileProviderAvailable_stillMarksFailed() {
+        // Discrimination boundary: OpenSearchEmbeddingClient wraps a JSON parse failure of the
+        // predict response body in an IOException too, but that is a genuine per-document/response
+        // defect -- a blanket "any IOException in the chain is retryable" rule would wrongly turn
+        // it into a permanent retry loop.
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "original content");
+        searchEngineClient.documentToReturn = doc;
+        helper.testChunks = List.of("chunk-a");
+        helper.testEmbeddingAvailable = true;
+        helper.testEmbedFailure =
+                new EmbeddingException("Failed to parse OpenSearch ML predict response", new IOException("Unexpected end-of-input"));
+
+        assertTrue(helper.processDocument("doc-1"), "the failure-path write must have been performed");
+        assertEquals(Constants.FAIL, searchEngineClient.lastStoredDoc.get(Constants.CONTENT_CHUNK_STATUS_FIELD));
+    }
+
+    @Test
+    public void test_processBatch_chunkOnlyMode_retryableShapedFailureStillMarksFailed() {
+        // In chunk-only mode no embedding provider is involved at all, so a retryable-LOOKING
+        // exception from the store path can never be a provider outage: the leniency must stay
+        // gated on embeddingActive.
+        final Map<String, Object> doc = baseDoc();
+        doc.put("content", "content-A");
+        helper.testDocumentsById.put("doc-A", doc);
+        helper.testChunksByContent.put("content-A", List.of("a1"));
+        searchEngineClient.throwOnStore = new SearchEngineClientException("Failed to store: {}", new IOException("Connection reset"));
+
+        final Map<String, Boolean> results = helper.processBatch(List.of("doc-A"), false);
+
+        assertTrue(results.get("doc-A"), "the chunk-only failure write must have been performed");
+        assertEquals("the chunk-only store attempt plus the fail write", 2, searchEngineClient.storeCallCount);
+        assertEquals(Constants.FAIL, searchEngineClient.lastStoredDoc.get(Constants.CONTENT_CHUNK_STATUS_FIELD));
     }
 
     // ===================================================================================
@@ -1433,6 +1617,46 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
     }
 
     // ===================================================================================
+    //                                        opt-in reprocessing of "fail" documents
+    //                                        ================================================
+    // content_chunk_status="fail" is otherwise terminal for the job: the pending query excludes it
+    // and there is no attempt counter. An operator who fixed the root cause needs an in-product
+    // way to retry those documents without a full recrawl.
+
+    @Test
+    public void test_buildPendingQuery_retryFailedUnset_neverMatchesFailedDocuments() {
+        assertFalse(helper.buildPendingQuery(true).toString().contains("\"fail\""),
+                "failed documents must NOT be reprocessed by default: " + helper.buildPendingQuery(true));
+        assertFalse(helper.buildPendingQuery(false).toString().contains("\"fail\""),
+                "failed documents must NOT be reprocessed by default: " + helper.buildPendingQuery(false));
+    }
+
+    @Test
+    public void test_buildPendingQuery_retryFailedEnabled_embeddingRun_alsoMatchesFailedDocuments() {
+        ComponentUtil.getFessConfig().setSystemProperty("content_chunker.job.retry_failed", "true");
+        final String json = helper.buildPendingQuery(true).toString();
+        assertTrue(json.contains("must_not"), "the status-absent branch must be retained: " + json);
+        assertTrue(json.contains("\"chunked\""), "the upgrade branch must be retained: " + json);
+        assertTrue(json.contains("\"fail\""), "an opt-in retry_failed run must also pick up failed documents: " + json);
+        assertTrue(json.contains("minimum_should_match"), json);
+    }
+
+    @Test
+    public void test_buildPendingQuery_retryFailedEnabled_chunkOnlyRun_alsoMatchesFailedDocuments() {
+        ComponentUtil.getFessConfig().setSystemProperty("content_chunker.job.retry_failed", "true");
+        final String json = helper.buildPendingQuery(false).toString();
+        assertTrue(json.contains("must_not"), "the status-absent branch must be retained: " + json);
+        assertTrue(json.contains("\"fail\""), "an opt-in retry_failed run must also pick up failed documents: " + json);
+        assertFalse(json.contains("\"chunked\""), "a chunk-only run must still NOT reprocess chunked documents: " + json);
+    }
+
+    @Test
+    public void test_buildPendingQuery_retryFailedExplicitlyFalse_neverMatchesFailedDocuments() {
+        ComponentUtil.getFessConfig().setSystemProperty("content_chunker.job.retry_failed", "false");
+        assertFalse(helper.buildPendingQuery(true).toString().contains("\"fail\""), "retry_failed=false must behave like unset");
+    }
+
+    // ===================================================================================
     //                                        vector-mapping-presence guard (Phase C)
     //                                        ================================================
     // An index created while embedding was off (chunk-only, or a pre-feature version) never had
@@ -1566,6 +1790,13 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
         assertNull(run.batchEmbeddingActive, "a transient outage must NEVER flip the run into chunk-only processing");
         assertTrue(result.toLowerCase(java.util.Locale.ROOT).contains("not available"),
                 "the skip result message must indicate the embedding provider is not available: " + result);
+        // The same message is emitted on EVERY run of a permanently misconfigured install (chunking
+        // enabled, model id never set), where it is not a transient outage at all. It must name
+        // both remediations so an operator is not left rereading an outage message forever.
+        assertTrue(result.contains("content_chunker.embedding.opensearch.model.id"),
+                "the skip summary must name the model-id remediation: " + result);
+        assertTrue(result.contains("content_chunker.embedding.name"),
+                "the skip summary must name the chunk-only (embedding.name=none) route: " + result);
     }
 
     @Test
@@ -1841,6 +2072,51 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
         assertEquals("content_chunker.job.concurrency", ChunkVectorHelper.JOB_CONCURRENCY_PROPERTY);
         assertEquals("content_chunker.job.bulk_size", ChunkVectorHelper.JOB_BULK_SIZE_PROPERTY);
         assertEquals("content_chunker.job.max_documents_per_run", ChunkVectorHelper.JOB_MAX_DOCUMENTS_PER_RUN_PROPERTY);
+        assertEquals("content_chunker.job.retry_failed", ChunkVectorHelper.JOB_RETRY_FAILED_PROPERTY);
+        // Duplicated from OpenSearchEmbeddingClient's private prefix+suffix purely to name it in the
+        // operator-facing "provider not available" remediation; pinned so the two cannot drift apart.
+        assertEquals("content_chunker.embedding.opensearch.model.id", ChunkVectorHelper.OPENSEARCH_MODEL_ID_PROPERTY);
+    }
+
+    // ===================================================================================
+    //                                        retryable-failure classification
+    //                                        ================================================
+
+    @Test
+    public void test_isRetryableEmbeddingFailure_classifiesTransportAndRetryableHttpShapes() {
+        assertTrue(
+                helper.isRetryableEmbeddingFailure(new EmbeddingException("Failed to call OpenSearch ML predict API",
+                        new IOException("OpenSearch ML predict API retryable error: 500 Internal Server Error",
+                                new RetryableHttpException("retryable http error: 500 Internal Server Error")))),
+                "a retry-exhausted retryable HTTP status must be classified retryable");
+        assertTrue(helper.isRetryableEmbeddingFailure(new SocketTimeoutException("Read timed out")), "a read timeout is retryable");
+        assertTrue(helper.isRetryableEmbeddingFailure(new java.net.ConnectException("Connection refused")),
+                "a connection refusal is retryable");
+        assertTrue(helper.isRetryableEmbeddingFailure(new java.net.UnknownHostException("opensearch")), "a DNS failure is retryable");
+    }
+
+    @Test
+    public void test_isRetryableEmbeddingFailure_doesNotClassifyPerDocumentDefectsAsRetryable() {
+        assertFalse(helper.isRetryableEmbeddingFailure(null), "an unknown cause must not be treated as retryable");
+        assertFalse(helper.isRetryableEmbeddingFailure(new EmbeddingException("OpenSearch ML predict API error: 400 Bad Request")),
+                "a non-retryable HTTP status is a per-document defect");
+        assertFalse(
+                helper.isRetryableEmbeddingFailure(new EmbeddingException("Failed to parse OpenSearch ML predict response",
+                        new IOException("Unexpected end-of-input"))),
+                "a response parse failure is a defect, not a retryable transport condition");
+        assertFalse(helper.isRetryableEmbeddingFailure(new EmbeddingException("Embedding count mismatch: chunks=3, vectors=2")),
+                "a count mismatch is a per-document defect");
+    }
+
+    @Test
+    public void test_isRetryableEmbeddingFailure_cyclicCauseChainTerminates() {
+        // A two-frame cycle (a -> b -> a) is not caught by a plain "cause == self" guard, so the
+        // walk must additionally be depth-bounded or the job thread spins forever.
+        final Exception a = new Exception("a");
+        final Exception b = new Exception("b");
+        a.initCause(b);
+        b.initCause(a);
+        assertFalse(helper.isRetryableEmbeddingFailure(a), "a cyclic cause chain must terminate, not spin");
     }
 
     /**
@@ -2032,7 +2308,23 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
         }
     }
 
-    private static final class TestableChunkVectorHelper extends ChunkVectorHelper {
+    /**
+     * Test double whose simple class name matches the one
+     * {@code OpenSearchEmbeddingClient} throws (and then wraps into the retry-exhausted
+     * {@link IOException}) for a retryable HTTP status. The real type is package-private in
+     * {@code org.codelibs.fess.embedding.opensearch}, so -- exactly as with
+     * {@link VersionConflictEngineException} above -- the classification is name-based and the
+     * test double reproduces the name rather than the type.
+     */
+    private static final class RetryableHttpException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        RetryableHttpException(final String message) {
+            super(message);
+        }
+    }
+
+    private static class TestableChunkVectorHelper extends ChunkVectorHelper {
         private boolean testEnabled = false;
         private String testDimension = null;
         /**
@@ -2146,6 +2438,16 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
             return testChunks;
         }
 
+        /** Records the production bound {@link ChunkVectorHelper#extractChunks} asks for, and honours it. */
+        int lastSplitLimit = -1;
+
+        @Override
+        protected List<String> splitContent(final String content, final int limit) {
+            lastSplitLimit = limit;
+            final List<String> chunks = splitContent(content);
+            return chunks.size() <= limit ? chunks : List.copyOf(chunks.subList(0, limit));
+        }
+
         @Override
         protected List<float[]> embedChunks(final List<String> chunks) {
             embedCalls.add(new ArrayList<>(chunks));
@@ -2176,6 +2478,38 @@ public class ChunkVectorHelperTest extends UnitFessTestCase {
         @Override
         protected FessConfig getFessConfigForContentField() {
             return super.getFessConfigForContentField();
+        }
+    }
+
+    /**
+     * A {@link TestableChunkVectorHelper} whose split seam PRODUCES its chunks one at a time and
+     * counts every chunk it creates, so "split everything then discard the excess" is
+     * distinguishable from "stop producing at the bound".
+     */
+    private static final class CountingSplitHelper extends TestableChunkVectorHelper {
+        /** How many chunks this document would split into if nothing bounded the production. */
+        int availableChunks;
+        /** How many chunks were actually created. */
+        int producedChunks;
+
+        @Override
+        protected List<String> splitContent(final String content) {
+            return produce(availableChunks);
+        }
+
+        @Override
+        protected List<String> splitContent(final String content, final int limit) {
+            lastSplitLimit = limit;
+            return produce(Math.min(availableChunks, Math.max(0, limit)));
+        }
+
+        private List<String> produce(final int count) {
+            final List<String> chunks = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                producedChunks++;
+                chunks.add("chunk-" + i);
+            }
+            return chunks;
         }
     }
 
