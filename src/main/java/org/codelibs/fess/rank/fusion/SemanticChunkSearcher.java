@@ -127,6 +127,9 @@ public class SemanticChunkSearcher extends DefaultSearcher {
     /** One-time warn latch for a min_score cutoff skipped due to a non-cosine space type. */
     private final AtomicBoolean minScoreSkippedWarned = new AtomicBoolean(false);
 
+    /** One-time warn latch for the exact (full-scan) mode, reset when the ann mode becomes available. */
+    private final AtomicBoolean exactModeWarned = new AtomicBoolean(false);
+
     /** Holds the query vector between {@link #search} and {@link #createSearchCondition}. */
     protected final ThreadLocal<float[]> queryVectorHolder = new ThreadLocal<>();
 
@@ -153,9 +156,12 @@ public class SemanticChunkSearcher extends DefaultSearcher {
     @PostConstruct
     public void register() {
         if (!isSearchEnabled()) {
-            if (logger.isDebugEnabled()) {
-                logger.debug("SemanticChunkSearcher is disabled ({}=false).", SEARCH_ENABLED_PROPERTY);
-            }
+            // This @PostConstruct is the only src/main caller of RankFusionProcessor#register, and
+            // registering allocates the fusion executor service, so the guard has to stay. That
+            // makes the property a startup-only switch even though every runtime gate re-reads it
+            // live, which has to be said out loud rather than hidden behind DEBUG.
+            logger.info("SemanticChunkSearcher is disabled ({}=false); it is not registered with the rank fusion processor. "
+                    + "Enabling the property later requires a restart to take effect.", SEARCH_ENABLED_PROPERTY);
             return;
         }
         logger.info("Load {}", getClass().getSimpleName());
@@ -195,6 +201,7 @@ public class SemanticChunkSearcher extends DefaultSearcher {
             return emptyResult();
         }
         final boolean annMode = isKnnIndexReady();
+        warnExactModeOnce(annMode);
         queryVectorHolder.set(queryVector);
         annModeHolder.set(annMode);
         try {
@@ -227,30 +234,64 @@ public class SemanticChunkSearcher extends DefaultSearcher {
         return searchRequestBuilder -> {
             final QueryHelper queryHelper = ComponentUtil.getQueryHelper();
             queryHelper.processSearchPreference(searchRequestBuilder, userBean, query);
-            final BoolQueryBuilder boolQuery = QueryBuilders.boolQuery();
+            final BoolQueryBuilder permissionQuery = QueryBuilders.boolQuery();
             if (params.getType() != SearchRequestType.ADMIN_SEARCH) {
                 final Set<String> roleSet = ComponentUtil.getRoleQueryHelper().build(params.getType());
                 if (!roleSet.isEmpty()) {
-                    queryHelper.buildRoleQuery(roleSet, boolQuery);
+                    queryHelper.buildRoleQuery(roleSet, permissionQuery);
                 }
                 final String virtualHostKey = ComponentUtil.getVirtualHostHelper().getVirtualHostKey();
                 if (StringUtil.isNotBlank(virtualHostKey)) {
-                    boolQuery.filter(QueryBuilders.termQuery(ComponentUtil.getFessConfig().getIndexFieldVirtualHost(), virtualHostKey));
+                    permissionQuery
+                            .filter(QueryBuilders.termQuery(ComponentUtil.getFessConfig().getIndexFieldVirtualHost(), virtualHostKey));
                 }
             }
+            final boolean hasPermissionQuery = permissionQuery.hasClauses();
+            final BoolQueryBuilder boolQuery = QueryBuilders.boolQuery();
+            if (hasPermissionQuery) {
+                // The outer clause is what actually enforces the constraint; the copy handed to
+                // the knn query below is a recall aid, not the security boundary.
+                boolQuery.filter(permissionQuery);
+            }
             final boolean annMode = Boolean.TRUE.equals(annModeHolder.get());
-            searchRequestBuilder
-                    .setQuery(boolQuery.must(annMode ? buildKnnChunkQuery(queryVector, params) : buildExactChunkQuery(queryVector)))
+            final QueryBuilder chunkQuery = annMode ? buildKnnChunkQuery(queryVector, params, hasPermissionQuery ? permissionQuery : null)
+                    : buildExactChunkQuery(queryVector);
+            searchRequestBuilder.setQuery(boolQuery.must(chunkQuery))
                     .setFrom(params.getStartPosition())
                     .setSize(params.getPageSize())
-                    .setFetchSource(params.getResponseFields(), null)
-                    .setTrackTotalHits(true);
+                    .setFetchSource(params.getResponseFields(), null);
             getMinScore().ifPresent(minScore -> resolveEngineMinScore(minScore, annMode).ifPresent(searchRequestBuilder::setMinScore));
             if (logger.isDebugEnabled()) {
                 logger.debug("Semantic chunk search mode: {}", annMode ? "ann" : "exact");
             }
             return true;
         };
+    }
+
+    /**
+     * Warns once when the exact (full-scan) vector mode is selected, i.e. the feature is enabled
+     * but the live index cannot serve approximate kNN. The exact mode is a
+     * {@code script_score} scan over every stored chunk vector on every plain-text query, and the
+     * only remedy is recreating/reindexing the index with the feature enabled, so a silent
+     * degradation would leave a permanent full scan undiagnosed. The latch resets once the ann
+     * mode becomes available so a later regression warns again.
+     *
+     * @param annMode whether the ann (knn query) mode was selected for this request
+     */
+    protected void warnExactModeOnce(final boolean annMode) {
+        if (annMode) {
+            exactModeWarned.set(false);
+            return;
+        }
+        if (exactModeWarned.compareAndSet(false, true)) {
+            logger.warn(
+                    "Semantic chunk search is falling back to the exact vector scan: the live index was not created with "
+                            + "index.knn and an ANN method on {}. Every plain-text query now scans all stored chunk vectors. "
+                            + "Recreate or reindex the index with {}=true so the ANN setting and method are baked in.",
+                    Constants.CONTENT_CHUNK_VECTOR_FIELD, SEARCH_ENABLED_PROPERTY);
+        } else if (logger.isDebugEnabled()) {
+            logger.debug("Semantic chunk search still using the exact vector scan.");
+        }
     }
 
     /**
@@ -264,9 +305,32 @@ public class SemanticChunkSearcher extends DefaultSearcher {
      * @return the nested knn query
      */
     protected QueryBuilder buildKnnChunkQuery(final float[] queryVector, final SearchRequestParams params) {
+        return buildKnnChunkQuery(queryVector, params, null);
+    }
+
+    /**
+     * Builds the approximate-kNN (HNSW) query, pushing the caller's permission constraint into
+     * the {@code knn} query itself (efficient filtering).
+     *
+     * <p>Without the in-query filter the ANN search collects the {@code k} globally nearest chunk
+     * vectors first and the sibling role/virtual-host clauses only post-filter that top-k, so a
+     * user whose roles cover a small slice of the corpus sees almost nothing. OpenSearch allows a
+     * filter inside a nested {@code knn} query to target a top-level field, and Fess builds this
+     * filter exclusively from term queries, which the k-NN plugin has always supported for
+     * nested-field filtering on the HNSW/Lucene and HNSW/Faiss combinations Fess defaults to.</p>
+     *
+     * @param queryVector the query embedding
+     * @param params the request params (used to size k against the requested window)
+     * @param filter the permission filter to apply during the ANN search, or null for none
+     * @return the nested knn query
+     */
+    protected QueryBuilder buildKnnChunkQuery(final float[] queryVector, final SearchRequestParams params, final QueryBuilder filter) {
         final String vectorField = Constants.CONTENT_CHUNK_VECTOR_FIELD + "." + ChunkVectorHelper.VECTOR_SUBFIELD;
         final int k = Math.max(getKnnK(), params.getStartPosition() + params.getPageSize());
         final KnnQueryBuilder knnQuery = new KnnQueryBuilder(vectorField, queryVector, k);
+        if (filter != null) {
+            knnQuery.filter(filter);
+        }
         getKnnEfSearch().ifPresent(knnQuery::efSearch);
         return QueryBuilders.nestedQuery(Constants.CONTENT_CHUNK_VECTOR_FIELD, knnQuery, ScoreMode.Max).ignoreUnmapped(true);
     }
@@ -369,13 +433,7 @@ public class SemanticChunkSearcher extends DefaultSearcher {
      * @return true if the setting is enabled
      */
     protected boolean hasKnnIndexSetting() {
-        final FessConfig fessConfig = ComponentUtil.getFessConfig();
-        final GetSettingsResponse response = ComponentUtil.getSearchEngineClient()
-                .admin()
-                .indices()
-                .prepareGetSettings(fessConfig.getIndexDocumentSearchIndex())
-                .execute()
-                .actionGet(fessConfig.getIndexIndicesTimeout());
+        final GetSettingsResponse response = readLiveIndexSettings();
         for (final String index : response.getIndexToSettings().keySet()) {
             if (response.getIndexToSettings().get(index).getAsBoolean("index.knn", false)) {
                 return true;
@@ -391,13 +449,7 @@ public class SemanticChunkSearcher extends DefaultSearcher {
      * @return true if the chunk vector field is ANN-ready
      */
     protected boolean hasAnnChunkVectorMapping() {
-        final FessConfig fessConfig = ComponentUtil.getFessConfig();
-        final GetMappingsResponse response = ComponentUtil.getSearchEngineClient()
-                .admin()
-                .indices()
-                .prepareGetMappings(fessConfig.getIndexDocumentSearchIndex())
-                .execute()
-                .actionGet(fessConfig.getIndexIndicesTimeout());
+        final GetMappingsResponse response = readLiveIndexMappings();
         final ChunkVectorHelper chunkVectorHelper = ComponentUtil.getComponent(ChunkVectorHelper.class);
         for (final MappingMetadata metadata : response.mappings().values()) {
             final Map<?, ?> propertiesMap = chunkVectorHelper.resolveMappingFields(metadata);
@@ -415,6 +467,37 @@ public class SemanticChunkSearcher extends DefaultSearcher {
             }
         }
         return false;
+    }
+
+    /**
+     * Reads the live settings of every index behind the search alias. Overridable seam for tests
+     * (the settings/mappings round trip needs a live cluster, which unit tests do not stand up).
+     *
+     * @return the settings response
+     */
+    protected GetSettingsResponse readLiveIndexSettings() {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        return ComponentUtil.getSearchEngineClient()
+                .admin()
+                .indices()
+                .prepareGetSettings(fessConfig.getIndexDocumentSearchIndex())
+                .execute()
+                .actionGet(fessConfig.getIndexIndicesTimeout());
+    }
+
+    /**
+     * Reads the live mappings of every index behind the search alias. Overridable seam for tests.
+     *
+     * @return the mappings response
+     */
+    protected GetMappingsResponse readLiveIndexMappings() {
+        final FessConfig fessConfig = ComponentUtil.getFessConfig();
+        return ComponentUtil.getSearchEngineClient()
+                .admin()
+                .indices()
+                .prepareGetMappings(fessConfig.getIndexDocumentSearchIndex())
+                .execute()
+                .actionGet(fessConfig.getIndexIndicesTimeout());
     }
 
     /**

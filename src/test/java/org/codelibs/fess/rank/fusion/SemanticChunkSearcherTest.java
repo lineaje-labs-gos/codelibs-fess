@@ -15,17 +15,57 @@
  */
 package org.codelibs.fess.rank.fusion;
 
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Property;
+import org.codelibs.fess.Constants;
+import org.codelibs.fess.entity.SearchRequestParams;
+import org.codelibs.fess.helper.ChunkVectorHelper;
+import org.codelibs.fess.helper.QueryHelper;
+import org.codelibs.fess.helper.RoleQueryHelper;
+import org.codelibs.fess.helper.VirtualHostHelper;
+import org.codelibs.fess.mylasta.action.FessUserBean;
+import org.codelibs.fess.mylasta.direction.FessConfig;
+import org.codelibs.fess.opensearch.client.SearchEngineClient;
+import org.codelibs.fess.opensearch.client.SearchEngineClient.SearchCondition;
 import org.codelibs.fess.unit.UnitFessTestCase;
+import org.codelibs.fess.util.ComponentUtil;
+import org.dbflute.optional.OptionalEntity;
+import org.dbflute.optional.OptionalThing;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
+import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
+import org.opensearch.action.admin.indices.settings.get.GetSettingsResponse;
+import org.opensearch.action.search.SearchAction;
+import org.opensearch.action.search.SearchRequestBuilder;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.common.settings.Settings;
 
 public class SemanticChunkSearcherTest extends UnitFessTestCase {
+
+    /**
+     * Request attribute {@code RoleQueryHelper} short-circuits on ({@code RoleQueryHelper.USER_ROLES},
+     * which is protected). Setting it makes the role set of a request deterministic in tests.
+     */
+    private static final String USER_ROLES_ATTRIBUTE = "userRoles";
 
     private SemanticChunkSearcher searcher;
 
     @Override
     protected void setUp(final TestInfo testInfo) throws Exception {
         super.setUp(testInfo);
+        // resolveEngineMinScore/hasAnnChunkVectorMapping resolve it by class from the container,
+        // which test_app.xml does not define
+        ComponentUtil.register(new ChunkVectorHelper(), ChunkVectorHelper.class.getCanonicalName());
         searcher = new SemanticChunkSearcher();
     }
 
@@ -200,6 +240,347 @@ public class SemanticChunkSearcherTest extends UnitFessTestCase {
         assertTrue(processor.registered);
     }
 
+    // -------------------------------------------------------------------------------------
+    //                                                              createSearchCondition
+    //                                                              ----------------------
+
+    @Test
+    public void test_createSearchCondition_annCarriesPermissionFilterIntoKnn() {
+        givenPermissionContext();
+        final String json = buildQueryJson(new GuardedSearcher(), true, new StubSearchRequestParams(0, 10));
+        final int knnIndex = json.indexOf("\"knn\"");
+        assertTrue(knnIndex >= 0, "ann mode must emit a knn query: " + json);
+        final String knnPart = json.substring(knnIndex);
+        // Without a filter inside the knn query the ANN top-k is collected globally and the
+        // sibling role/virtual-host clauses only post-filter it, so a narrowly-permissioned
+        // user gets a near-empty page. The knn body itself has to carry the constraint.
+        assertTrue(knnPart.contains("\"filter\""), "the knn query must carry the permission filter: " + json);
+        final String filterPart = knnPart.substring(knnPart.indexOf("\"filter\""));
+        assertTrue(filterPart.contains("\"role\":{\"value\":\"Rguest\""), "the knn filter must carry the role terms: " + json);
+        assertTrue(filterPart.contains("\"virtual_host\":{\"value\":\"vhost1\""),
+                "the knn filter must carry the virtual host term: " + json);
+        // ... and the outer query must keep enforcing it (the knn filter is a recall aid, not
+        // the security boundary), so the role term is serialized twice.
+        assertEquals(2, countOccurrences(json, "\"role\":{\"value\":\"Rguest\""), json);
+        assertEquals(2, countOccurrences(json, "\"virtual_host\":{\"value\":\"vhost1\""), json);
+    }
+
+    @Test
+    public void test_createSearchCondition_exactKeepsPermissionOnOuterQueryOnly() {
+        givenPermissionContext();
+        final String json = buildQueryJson(new GuardedSearcher(), false, new StubSearchRequestParams(0, 10));
+        assertTrue(json.contains("script_score"), json);
+        assertFalse(json.contains("\"knn\""), json);
+        // exact mode has no in-query top-k truncation, so a single outer permission clause is enough
+        assertEquals(1, countOccurrences(json, "\"role\":{\"value\":\"Rguest\""), json);
+        assertEquals(1, countOccurrences(json, "\"virtual_host\":{\"value\":\"vhost1\""), json);
+    }
+
+    @Test
+    public void test_createSearchCondition_doesNotTrackTotalHits() {
+        givenPermissionContext();
+        final SearchRequestBuilder builder = buildRequest(new GuardedSearcher(), false, new StubSearchRequestParams(0, 10));
+        // RankFusionProcessor derives allRecordCount from the main searcher only, so the
+        // semantic total is computed and thrown away.
+        assertTrue(builder.request().source().trackTotalHitsUpTo() == null,
+                "track_total_hits must not be requested: " + builder.request().source());
+        assertFalse(builder.request().source().toString().replaceAll("\\s", "").contains("track_total_hits"),
+                builder.request().source().toString());
+    }
+
+    // -------------------------------------------------------------------------------------
+    //                                                                      mode diagnostics
+    //                                                                      ----------------
+
+    @Test
+    public void test_search_warnsOnceWhenExactModeIsUsed() {
+        final LogCapturingAppender appender = LogCapturingAppender.attach(SemanticChunkSearcher.class);
+        try {
+            final GuardedSearcher guarded = new EmptyResponseSearcher();
+            for (int i = 0; i < 2; i++) {
+                guarded.search("plain query", new StubSearchRequestParams(0, 10), OptionalThing.empty());
+            }
+            final List<String> exactWarnings =
+                    appender.messagesAt(Level.WARN).stream().filter(m -> m.contains("exact vector scan")).toList();
+            assertEquals(1, exactWarnings.size(), "the exact-mode fallback must warn exactly once: " + appender.messagesAt(Level.WARN));
+            assertTrue(exactWarnings.get(0).contains("content_chunker.search.enabled"),
+                    "the warning must name the remedy: " + exactWarnings.get(0));
+        } finally {
+            appender.detach();
+        }
+    }
+
+    @Test
+    public void test_search_doesNotWarnWhenAnnModeIsUsed() {
+        final LogCapturingAppender appender = LogCapturingAppender.attach(SemanticChunkSearcher.class);
+        try {
+            final GuardedSearcher guarded = new EmptyResponseSearcher() {
+                @Override
+                protected boolean isKnnIndexReady() {
+                    return true;
+                }
+            };
+            guarded.search("plain query", new StubSearchRequestParams(0, 10), OptionalThing.empty());
+            assertTrue(appender.messagesAt(Level.WARN).stream().noneMatch(m -> m.contains("exact vector scan")),
+                    appender.messagesAt(Level.WARN).toString());
+        } finally {
+            appender.detach();
+        }
+    }
+
+    @Test
+    public void test_register_logsRestartRequirementWhenDisabled() {
+        final LogCapturingAppender appender = LogCapturingAppender.attach(SemanticChunkSearcher.class);
+        try {
+            final GuardedSearcher disabled = new GuardedSearcher();
+            disabled.enabled = false;
+            disabled.register();
+            // register() is the only src/main caller of RankFusionProcessor#register and it runs
+            // once at @PostConstruct, so flipping the property at runtime can never take effect.
+            // That has to be stated at INFO, not hidden behind DEBUG.
+            final List<String> infos = appender.messagesAt(Level.INFO);
+            assertTrue(infos.stream().anyMatch(m -> m.contains(SemanticChunkSearcher.SEARCH_ENABLED_PROPERTY) && m.contains("restart")),
+                    "a disabled searcher must state the restart requirement at INFO: " + infos);
+        } finally {
+            appender.detach();
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    //                                                                  ann readiness probing
+    //                                                                  ---------------------
+
+    @Test
+    public void test_hasKnnIndexSetting() {
+        assertTrue(new ProbeSearcher().withSettings(Settings.builder().put("index.knn", true).build()).hasKnnIndexSetting());
+        assertFalse(new ProbeSearcher().withSettings(Settings.builder().put("index.knn", false).build()).hasKnnIndexSetting());
+        assertFalse(new ProbeSearcher().withSettings(Settings.EMPTY).hasKnnIndexSetting());
+    }
+
+    @Test
+    public void test_hasAnnChunkVectorMapping_requiresKnnVectorTypeAndMethodBlock() {
+        ComponentUtil.register(new ChunkVectorHelper(), ChunkVectorHelper.class.getCanonicalName());
+        // the whole point of the design: index.knn alone is not enough, the chunk vector field
+        // must be a knn_vector carrying an explicit ANN method block
+        assertTrue(new ProbeSearcher().withVectorMapping(Map.of("type", "knn_vector", "dimension", 3, "method", Map.of("name", "hnsw")))
+                .hasAnnChunkVectorMapping());
+        assertFalse(new ProbeSearcher().withVectorMapping(Map.of("type", "knn_vector", "dimension", 3)).hasAnnChunkVectorMapping(),
+                "a method-less knn_vector scores on a different scale and must not enable ann mode");
+        assertFalse(
+                new ProbeSearcher().withVectorMapping(Map.of("type", "float", "method", Map.of("name", "hnsw"))).hasAnnChunkVectorMapping(),
+                "a non knn_vector field must not enable ann mode");
+        assertFalse(new ProbeSearcher().withVectorMapping(Map.of("type", "knn_vector", "method", "hnsw")).hasAnnChunkVectorMapping(),
+                "a scalar method value is not an ANN method block");
+        assertFalse(new ProbeSearcher().withNoChunkVectorField().hasAnnChunkVectorMapping());
+    }
+
+    @Test
+    public void test_isKnnIndexReady_requiresBothSettingAndMapping() {
+        assertTrue(new ProbeSearcher().settingReady(true).mappingReady(true).isKnnIndexReady());
+        assertFalse(new ProbeSearcher().settingReady(true).mappingReady(false).isKnnIndexReady(),
+                "index.knn without an ANN mapping must not select ann mode");
+        assertFalse(new ProbeSearcher().settingReady(false).mappingReady(true).isKnnIndexReady(),
+                "an ANN mapping without index.knn must not select ann mode");
+        assertFalse(new ProbeSearcher().settingReady(false).mappingReady(false).isKnnIndexReady());
+    }
+
+    @Test
+    public void test_isKnnIndexReady_cachesTheProbe() {
+        final ProbeSearcher probe = new ProbeSearcher().settingReady(true).mappingReady(true);
+        assertTrue(probe.isKnnIndexReady());
+        assertTrue(probe.isKnnIndexReady());
+        assertEquals(1, probe.settingProbeCount, "the readiness answer must be cached between requests");
+        assertEquals(1, probe.mappingProbeCount);
+    }
+
+    @Test
+    public void test_isKnnIndexReady_swallowsProbeFailure() {
+        final ProbeSearcher probe = new ProbeSearcher().settingReady(true).mappingReady(true);
+        probe.probeFailure = new RuntimeException("probe boom");
+        assertFalse(probe.isKnnIndexReady(), "a failed probe must degrade to the exact mode, not propagate");
+    }
+
+    @Test
+    public void test_search_invalidatesKnnReadyCacheWhenAnnSearchFails() {
+        final ProbeSearcher probe = new ProbeSearcher().settingReady(true).mappingReady(true);
+        probe.failSendRequest = true;
+        for (int i = 0; i < 2; i++) {
+            assertEquals(0, probe.search("plain query", new StubSearchRequestParams(0, 10), OptionalThing.empty()).getAllRecordCount());
+        }
+        // an ann query that blew up (e.g. the index was reindexed without index.knn while the
+        // cache was warm) must force a re-probe instead of failing for the next 60 seconds
+        assertEquals(2, probe.settingProbeCount, "a failed ann search must invalidate the readiness cache");
+    }
+
+    // -------------------------------------------------------------------------------------
+    //                                                                          test helpers
+    //                                                                          ------------
+
+    private void givenPermissionContext() {
+        ComponentUtil.register(new QueryHelper(), "queryHelper");
+        ComponentUtil.register(new RoleQueryHelper(), "roleQueryHelper");
+        ComponentUtil.register(new VirtualHostHelper(), "virtualHostHelper");
+        getMockRequest().setAttribute(USER_ROLES_ATTRIBUTE, Set.of("Rguest"));
+        getMockRequest().setAttribute(FessConfig.VIRTUAL_HOST_VALUE, "vhost1");
+    }
+
+    private SearchRequestBuilder buildRequest(final SemanticChunkSearcher target, final boolean annMode, final SearchRequestParams params) {
+        target.queryVectorHolder.set(new float[] { 0.1f, 0.2f });
+        target.annModeHolder.set(annMode);
+        try {
+            final SearchCondition<SearchRequestBuilder> condition =
+                    target.createSearchCondition("plain query", params, OptionalThing.empty());
+            final SearchRequestBuilder builder = new SearchRequestBuilder(new SearchEngineClient(), SearchAction.INSTANCE);
+            assertTrue(condition.build(builder));
+            return builder;
+        } finally {
+            target.queryVectorHolder.remove();
+            target.annModeHolder.remove();
+        }
+    }
+
+    private String buildQueryJson(final SemanticChunkSearcher target, final boolean annMode, final SearchRequestParams params) {
+        return buildRequest(target, annMode, params).request().source().query().toString().replaceAll("\\s", "");
+    }
+
+    private static int countOccurrences(final String text, final String token) {
+        int count = 0;
+        int index = text.indexOf(token);
+        while (index >= 0) {
+            count++;
+            index = text.indexOf(token, index + token.length());
+        }
+        return count;
+    }
+
+    /**
+     * Searcher exercising the real readiness probing: the settings/mappings round trips are
+     * replaced by canned responses, everything above them (parsing, the {@code &&}, the cache)
+     * stays production code.
+     */
+    private static class ProbeSearcher extends SemanticChunkSearcher {
+        int settingProbeCount = 0;
+        int mappingProbeCount = 0;
+        boolean failSendRequest = false;
+        RuntimeException probeFailure;
+        private Settings settings = Settings.EMPTY;
+        private Map<String, Object> properties = Map.of();
+
+        ProbeSearcher withSettings(final Settings settings) {
+            this.settings = settings;
+            return this;
+        }
+
+        ProbeSearcher settingReady(final boolean ready) {
+            return withSettings(Settings.builder().put("index.knn", ready).build());
+        }
+
+        ProbeSearcher mappingReady(final boolean ready) {
+            return ready ? withVectorMapping(Map.of("type", "knn_vector", "dimension", 3, "method", Map.of("name", "hnsw")))
+                    : withNoChunkVectorField();
+        }
+
+        ProbeSearcher withVectorMapping(final Map<String, Object> vectorMapping) {
+            properties = Map.of(Constants.CONTENT_CHUNK_VECTOR_FIELD,
+                    Map.of("type", "nested", "properties", Map.of(ChunkVectorHelper.VECTOR_SUBFIELD, vectorMapping)));
+            return this;
+        }
+
+        ProbeSearcher withNoChunkVectorField() {
+            properties = Map.of("content", Map.of("type", "text"));
+            return this;
+        }
+
+        @Override
+        protected boolean isSearchEnabled() {
+            return true;
+        }
+
+        @Override
+        protected GetSettingsResponse readLiveIndexSettings() {
+            settingProbeCount++;
+            if (probeFailure != null) {
+                throw probeFailure;
+            }
+            return new GetSettingsResponse(Map.of("fess.001", settings), Map.of());
+        }
+
+        @Override
+        protected GetMappingsResponse readLiveIndexMappings() {
+            mappingProbeCount++;
+            if (probeFailure != null) {
+                throw probeFailure;
+            }
+            return new GetMappingsResponse(Map.of("fess.001", new MappingMetadata("_doc", Map.of("properties", properties))));
+        }
+
+        @Override
+        protected org.codelibs.fess.embedding.EmbeddingClientManager getEmbeddingClientManager() {
+            return new org.codelibs.fess.embedding.EmbeddingClientManager() {
+                @Override
+                public boolean available() {
+                    return true;
+                }
+
+                @Override
+                public float[] embedQuery(final String query) {
+                    return new float[] { 0.1f, 0.2f };
+                }
+            };
+        }
+
+        @Override
+        protected OptionalEntity<SearchResponse> sendRequest(final String query, final SearchRequestParams params,
+                final OptionalThing<FessUserBean> userBean) {
+            if (failSendRequest) {
+                throw new RuntimeException("engine boom");
+            }
+            return OptionalEntity.empty();
+        }
+    }
+
+    /** Guarded searcher whose engine round-trip is short-circuited to an empty response. */
+    private static class EmptyResponseSearcher extends GuardedSearcher {
+        @Override
+        protected OptionalEntity<SearchResponse> sendRequest(final String query, final SearchRequestParams params,
+                final OptionalThing<FessUserBean> userBean) {
+            return OptionalEntity.empty();
+        }
+    }
+
+    /** Minimal in-memory log4j2 appender for asserting on emitted log messages. */
+    static final class LogCapturingAppender extends AbstractAppender {
+        private final List<LogEvent> events = new CopyOnWriteArrayList<>();
+        private final org.apache.logging.log4j.core.Logger boundLogger;
+
+        private LogCapturingAppender(final org.apache.logging.log4j.core.Logger logger) {
+            super("LogCapturingAppender-" + UUID.randomUUID(), null, null, true, Property.EMPTY_ARRAY);
+            this.boundLogger = logger;
+        }
+
+        static LogCapturingAppender attach(final Class<?> targetClass) {
+            final org.apache.logging.log4j.core.Logger logger = (org.apache.logging.log4j.core.Logger) LogManager.getLogger(targetClass);
+            final LogCapturingAppender appender = new LogCapturingAppender(logger);
+            appender.start();
+            logger.addAppender(appender);
+            return appender;
+        }
+
+        void detach() {
+            boundLogger.removeAppender(this);
+            stop();
+        }
+
+        @Override
+        public void append(final LogEvent event) {
+            events.add(event.toImmutable());
+        }
+
+        List<String> messagesAt(final Level level) {
+            return events.stream().filter(e -> e.getLevel() == level).map(e -> e.getMessage().getFormattedMessage()).toList();
+        }
+    }
+
     private static class CapturingRankFusionProcessor extends RankFusionProcessor {
         boolean registered = false;
 
@@ -312,6 +693,13 @@ public class SemanticChunkSearcherTest extends UnitFessTestCase {
         @Override
         public String[] getExtraQueries() {
             return new String[0];
+        }
+
+        @Override
+        public String[] getResponseFields() {
+            // the real implementation resolves queryFieldConfig from the container, which
+            // test_app.xml does not define
+            return new String[] { "doc_id" };
         }
 
         @Override

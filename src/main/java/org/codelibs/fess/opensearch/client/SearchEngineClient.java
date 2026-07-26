@@ -710,7 +710,7 @@ public class SearchEngineClient implements Client {
 
         final String indexConfigFile = getResourcePath(indexConfigPath, fesenType, "/" + index + ".json");
         try {
-            final String source = readIndexSetting(fesenType, indexConfigFile, numberOfShards, autoExpandReplicas);
+            final String source = readIndexSetting(index, fesenType, indexConfigFile, numberOfShards, autoExpandReplicas);
             final CreateIndexResponse indexResponse = client.admin()
                     .indices()
                     .prepareCreate(indexName)
@@ -976,13 +976,19 @@ public class SearchEngineClient implements Client {
     /**
      * Reads and processes index settings from configuration file.
      *
+     * <p>The document settings rewrite rules are applied to the document index only, mirroring
+     * {@link #addMapping(String, String, String, boolean)}'s guard for the mapping rules: they
+     * anchor on document-index constructs, so running them over the other index config files
+     * only produces anchor-miss warnings naming a file unrelated to the index being created.</p>
+     *
+     * @param index              the index configuration name
      * @param fesenType          the search engine type
      * @param indexConfigFile    the path to the index configuration file
      * @param numberOfShards     the number of primary shards
      * @param autoExpandReplicas the auto expand replicas setting
      * @return the processed index settings JSON
      */
-    protected String readIndexSetting(final String fesenType, final String indexConfigFile, final String numberOfShards,
+    protected String readIndexSetting(final String index, final String fesenType, final String indexConfigFile, final String numberOfShards,
             final String autoExpandReplicas) {
         final FessConfig fessConfig = ComponentUtil.getFessConfig();
         String source = FileUtil.readUTF8(indexConfigFile);
@@ -994,8 +1000,10 @@ public class SearchEngineClient implements Client {
                 .replaceAll(Pattern.quote("${fess.index.codec}"), fessConfig.getIndexCodec())//
                 .replaceAll(Pattern.quote("${fess.index.number_of_shards}"), numberOfShards)//
                 .replaceAll(Pattern.quote("${fess.index.auto_expand_replicas}"), autoExpandReplicas);
-        for (final UnaryOperator<String> rule : docSettingRewriteRuleList) {
-            source = rule.apply(source);
+        if (DOC_INDEX.equals(index)) {
+            for (final UnaryOperator<String> rule : docSettingRewriteRuleList) {
+                source = rule.apply(source);
+            }
         }
         return source;
     }
