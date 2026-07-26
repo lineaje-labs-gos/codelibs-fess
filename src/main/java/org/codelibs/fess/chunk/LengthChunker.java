@@ -115,7 +115,20 @@ public class LengthChunker implements Chunker {
 
     @Override
     public List<String> split(final String content) {
-        if (StringUtil.isBlank(content)) {
+        return split(content, Integer.MAX_VALUE);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Overridden to stop <em>producing</em> substrings once {@code limit} chunks exist, rather
+     * than inheriting {@link Chunker}'s split-everything-then-truncate default: an oversized
+     * document that the caller is only going to mark {@code skipped} never materializes its full
+     * chunk list.</p>
+     */
+    @Override
+    public List<String> split(final String content, final int limit) {
+        if (limit <= 0 || StringUtil.isBlank(content)) {
             return Collections.emptyList();
         }
         final int chunkSize = normalizeChunkSize(getChunkSize());
@@ -139,6 +152,11 @@ public class LengthChunker implements Chunker {
                 end = start + 1;
             }
             chunks.add(content.substring(start, end));
+            if (chunks.size() >= limit) {
+                // Production bound: stop here instead of splitting the remainder only to have the
+                // caller discard it. See Chunker#split(String, int).
+                break;
+            }
             if (end >= length) {
                 break;
             }
@@ -169,6 +187,13 @@ public class LengthChunker implements Chunker {
 
     /**
      * Gets the configured chunk size in characters.
+     *
+     * <p>Changing this value only affects documents that have not yet reached a terminal
+     * {@code content_chunk_status}. A document already stored as a chunk array keeps its original
+     * boundaries: nothing records which chunk size produced it, and
+     * {@code ChunkVectorHelper#extractExistingChunks} deliberately reuses the stored array rather
+     * than re-splitting it. Re-chunking an existing corpus therefore requires a recrawl -- which
+     * replaces {@code _source} wholesale and so does pick up the new size.</p>
      *
      * @return the value of {@code content_chunker.length.chunk_size} (default 800)
      */

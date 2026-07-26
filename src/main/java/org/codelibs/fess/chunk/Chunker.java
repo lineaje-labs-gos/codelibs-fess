@@ -38,6 +38,39 @@ public interface Chunker {
     List<String> split(String content);
 
     /**
+     * Splits the given content into at most {@code limit} chunk strings, stopping chunk
+     * <em>production</em> once the limit is reached rather than producing every chunk and
+     * discarding the excess.
+     *
+     * <p>The caller ({@link org.codelibs.fess.helper.ChunkVectorHelper}) only needs to know whether
+     * a document exceeds {@code content_chunker.max_chunks_per_document}, so it asks for
+     * {@code cap + 1} chunks: an oversized document is then detected from a
+     * {@code cap + 1}-element result without ever materializing the full chunk list of a document
+     * that is about to be marked {@code skipped} anyway. With the shipped defaults an unbounded
+     * split of a pathological document can retain hundreds of megabytes of substrings across the
+     * job's concurrent batches, against the chunk-indexer child JVM's small heap.</p>
+     *
+     * <p>The default implementation is a correctness-only fallback for third-party chunkers that
+     * do not override it: it splits fully and then truncates, so the returned value is right but
+     * the memory bound is not achieved. Implementations whose splitting is incremental (such as
+     * {@link LengthChunker}) MUST override this to stop early.</p>
+     *
+     * @param content the document content to split
+     * @param limit the maximum number of chunks to produce; a non-positive value yields an empty list
+     * @return the first {@code limit} chunks, in order; an empty list if content is blank
+     */
+    default List<String> split(final String content, final int limit) {
+        if (limit <= 0) {
+            return List.of();
+        }
+        final List<String> chunks = split(content);
+        if (chunks.size() <= limit) {
+            return chunks;
+        }
+        return List.copyOf(chunks.subList(0, limit));
+    }
+
+    /**
      * Returns the name of this chunker (e.g. "length"), used for resolution
      * via the {@code content_chunker.chunker.name} system property.
      *

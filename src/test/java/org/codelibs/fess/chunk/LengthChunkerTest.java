@@ -218,6 +218,76 @@ public class LengthChunkerTest extends UnitFessTestCase {
         assertEquals(content, String.join("", chunks));
     }
 
+    // ===================================================================================
+    //                                        bounded chunk production (split(String, int))
+    //                                        ================================================
+    // ChunkVectorHelper only needs to know whether a document exceeds
+    // content_chunker.max_chunks_per_document, so it asks for cap+1 chunks. LengthChunker must
+    // stop PRODUCING substrings there rather than splitting the whole document and discarding the
+    // excess -- an oversized document about to be marked "skipped" must never materialize its
+    // full chunk list in the chunk-indexer child JVM's small heap.
+
+    @Test
+    public void test_splitWithLimit_returnsExactlyTheUnboundedPrefix() {
+        chunker.setTestChunkSize(4);
+        chunker.setTestOverlap(0);
+        final String content = "abcdefghijklmnopqrst"; // 20 chars -> 5 chunks of 4
+        final List<String> unbounded = chunker.split(content);
+        assertEquals(5, unbounded.size());
+        for (int limit = 1; limit <= 5; limit++) {
+            final List<String> bounded = chunker.split(content, limit);
+            assertEquals(limit, bounded.size(), "limit=" + limit);
+            assertEquals("bounded split must equal the unbounded prefix. limit=" + limit, unbounded.subList(0, limit), bounded);
+        }
+    }
+
+    @Test
+    public void test_splitWithLimit_limitAboveChunkCount_returnsEveryChunk() {
+        chunker.setTestChunkSize(4);
+        chunker.setTestOverlap(0);
+        final String content = "abcdefgh"; // 2 chunks
+        assertEquals(List.of("abcd", "efgh"), chunker.split(content, 100));
+    }
+
+    @Test
+    public void test_splitWithLimit_nonPositiveLimit_returnsEmptyList() {
+        chunker.setTestChunkSize(4);
+        assertTrue(chunker.split("abcdefgh", 0).isEmpty(), "limit=0 must produce nothing");
+        assertTrue(chunker.split("abcdefgh", -1).isEmpty(), "a negative limit must produce nothing");
+    }
+
+    @Test
+    public void test_splitWithLimit_blankContent_returnsEmptyList() {
+        assertTrue(chunker.split("   ", 5).isEmpty());
+        assertTrue(chunker.split(null, 5).isEmpty());
+    }
+
+    @Test
+    public void test_splitWithLimit_withOverlap_matchesUnboundedPrefix() {
+        chunker.setTestChunkSize(5);
+        chunker.setTestOverlap(2);
+        final String content = "abcdefghijklmnopqrstuvwxyz";
+        final List<String> unbounded = chunker.split(content);
+        assertTrue(unbounded.size() > 3, "precondition: the unbounded split must produce more than the limit");
+        assertEquals(unbounded.subList(0, 3), chunker.split(content, 3));
+    }
+
+    @Test
+    public void test_splitWithLimit_neverSplitsSurrogatePair() {
+        // The bounded path must reuse the same surrogate-pair boundary adjustment as the unbounded
+        // one: a truncated result must still contain only well-formed UTF-16.
+        chunker.setTestChunkSize(3);
+        chunker.setTestOverlap(0);
+        final String content = "a😀b😀c😀d";
+        final List<String> unbounded = chunker.split(content);
+        final List<String> bounded = chunker.split(content, 2);
+        assertEquals(unbounded.subList(0, 2), bounded);
+        for (final String chunk : bounded) {
+            assertFalse(Character.isHighSurrogate(chunk.charAt(chunk.length() - 1)), "trailing unpaired high surrogate in: " + chunk);
+            assertFalse(Character.isLowSurrogate(chunk.charAt(0)), "leading unpaired low surrogate in: " + chunk);
+        }
+    }
+
     private static final class TestableLengthChunker extends LengthChunker {
         private int testChunkSize = 800;
         private int testOverlap = 0;

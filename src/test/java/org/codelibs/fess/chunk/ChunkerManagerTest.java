@@ -77,6 +77,100 @@ public class ChunkerManagerTest extends UnitFessTestCase {
         assertTrue(manager.split("x").isEmpty(), "should return empty list when unresolved");
     }
 
+    // ===================================================================================
+    //                                        bounded chunk production
+    //                                        ================================================
+
+    @Test
+    public void test_splitWithLimit_stopsProducingAtTheLimit() {
+        // A 10x oversized document: the chunker must PRODUCE at most `limit` chunks, not produce
+        // all 1000 and let the caller discard 900 of them.
+        final CountingChunker counting = new CountingChunker("counting");
+        counting.availableChunks = 1000;
+        manager.register(counting);
+        manager.setTestChunkerType("counting");
+
+        final List<String> chunks = manager.split("irrelevant", 100);
+
+        assertEquals(100, chunks.size(), "the result must be capped at the limit");
+        assertEquals(100, counting.producedChunks,
+                "chunk PRODUCTION must stop at the limit -- an oversized document must never materialize its full chunk list");
+    }
+
+    @Test
+    public void test_splitWithLimit_nonPositiveLimit_producesNothing() {
+        final CountingChunker counting = new CountingChunker("counting");
+        counting.availableChunks = 10;
+        manager.register(counting);
+        manager.setTestChunkerType("counting");
+
+        assertTrue(manager.split("irrelevant", 0).isEmpty(), "limit=0 must produce nothing");
+        assertEquals(0, counting.producedChunks, "no chunk may be produced for a non-positive limit");
+    }
+
+    @Test
+    public void test_splitWithLimit_defaultSpiImplementation_truncatesForThirdPartyChunkers() {
+        // A third-party Chunker that does not override the bounded overload still gets a correct
+        // (if not memory-bounded) result from the SPI default.
+        final FakeChunker fake = new FakeChunker("plain");
+        fake.result = List.of("a", "b", "c", "d");
+        manager.register(fake);
+        manager.setTestChunkerType("plain");
+
+        assertEquals(List.of("a", "b"), manager.split("irrelevant", 2));
+        assertEquals(List.of("a", "b", "c", "d"), manager.split("irrelevant", 99));
+    }
+
+    @Test
+    public void test_splitWithLimit_returnsEmptyListWhenNoChunkerResolved() {
+        manager.setTestChunkerType("missing");
+        assertTrue(manager.split("x", 5).isEmpty(), "should return empty list when unresolved");
+    }
+
+    /**
+     * A {@link Chunker} that natively honours the production bound and counts every chunk it
+     * actually creates, so a "split everything then truncate" implementation is distinguishable
+     * from one that stops early.
+     */
+    private static final class CountingChunker implements Chunker {
+        private final String name;
+        int availableChunks;
+        int producedChunks;
+
+        CountingChunker(final String name) {
+            this.name = name;
+        }
+
+        @Override
+        public List<String> split(final String content) {
+            return produce(availableChunks);
+        }
+
+        @Override
+        public List<String> split(final String content, final int limit) {
+            return produce(Math.min(availableChunks, Math.max(0, limit)));
+        }
+
+        private List<String> produce(final int count) {
+            final List<String> chunks = new java.util.ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                producedChunks++;
+                chunks.add("chunk-" + i);
+            }
+            return chunks;
+        }
+
+        @Override
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public void register() {
+            // no-op for test fake
+        }
+    }
+
     private static final class FakeChunker implements Chunker {
         private final String name;
         List<String> result = Collections.emptyList();
