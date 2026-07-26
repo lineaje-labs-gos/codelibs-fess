@@ -60,6 +60,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * engine. The model must be deployed by the operator beforehand; this client
  * performs no model management (no register/deploy/undeploy, no task polling).
  *
+ * <p><b>Two different configuration channels are in play here, and they behave
+ * differently.</b> This client's own {@code content_chunker.embedding.opensearch.*}
+ * keys ({@code api.url}, {@code model.id}, {@code username}, {@code password},
+ * {@code timeout}, {@code retry.*}, ...) are read via
+ * {@link #getConfigString(String, String)}/{@code getConfigInt}, i.e. through
+ * {@code FessConfig.getOrDefault}: they come from {@code conf/fess_config.properties}
+ * or a {@code -Dfess.config.*} JVM argument, are memoized for the JVM's lifetime, and
+ * therefore need a restart to change. The feature-level keys
+ * {@code content_chunker.enabled}, {@code content_chunker.embedding.name} and
+ * {@code content_chunker.embedding.dimension} instead use
+ * {@code FessProp.getSystemProperty}, which reads the mutable {@code systemProperties}
+ * component (falling back to {@code -Dfess.system.<key>}) and so reflects a change without a
+ * restart. Setting an {@code ...opensearch.*} key through that channel silently has no
+ * effect.</p>
+ *
  * @see <a href="https://docs.opensearch.org/latest/ml-commons-plugin/api/train-predict/predict/">ML Commons Predict API</a>
  */
 public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
@@ -193,8 +208,11 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
      * deployed state ({@code DEPLOYED} or {@code PARTIALLY_DEPLOYED}). Every
      * other state ({@code REGISTERING}, {@code REGISTERED}, {@code DEPLOYING},
      * {@code UNDEPLOYED}, {@code DEPLOY_FAILED}, ...) means predict calls
-     * would fail, so it is reported as unavailable. Also emits WARN-level
-     * diagnostics via {@link #warnOnModelDiagnostics(JsonNode)}.
+     * would fail, so it is reported as unavailable. A deployed model whose real
+     * vector width contradicts the configured one is also reported as
+     * unavailable (see {@link #hasDimensionMismatch(JsonNode)}), and further
+     * WARN-level diagnostics are emitted via
+     * {@link #warnOnModelDiagnostics(JsonNode)}.
      *
      * @param responseBody the response body from the model get endpoint
      * @return true if the model is deployed enough to serve predict calls
@@ -203,6 +221,9 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
         try {
             final JsonNode jsonNode = objectMapper.readTree(responseBody);
             warnOnModelDiagnostics(jsonNode);
+            if (hasDimensionMismatch(jsonNode)) {
+                return false;
+            }
             final String modelState = jsonNode.path("model_state").asText();
             if (MODEL_STATE_DEPLOYED.equals(modelState) || MODEL_STATE_PARTIALLY_DEPLOYED.equals(modelState)) {
                 return true;
@@ -217,12 +238,12 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
 
     /**
      * Emits WARN-level diagnostics for likely misconfigurations visible in the
-     * model document, without failing the availability check: an
-     * {@code algorithm} other than {@code TEXT_EMBEDDING}, and a
-     * {@code model_config.embedding_dimension} that differs from the configured
-     * {@link #getDimension()}. The latter catches a dimension misconfiguration
-     * at startup instead of at the first embed call. Diagnostics only; the
-     * availability result is unaffected.
+     * model document without failing the availability check: currently an
+     * {@code algorithm} other than {@code TEXT_EMBEDDING}, which is suspicious
+     * but does not by itself guarantee that predict calls are unusable.
+     * Diagnostics only; the availability result is unaffected. The dimension
+     * check is <em>not</em> here, because a dimension mismatch does guarantee
+     * failure - see {@link #hasDimensionMismatch(JsonNode)}.
      *
      * @param modelNode the parsed model get response
      */
@@ -232,23 +253,51 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
             logger.warn("[Embedding:OPENSEARCH] Model algorithm is not {}. modelId={}, algorithm={}", EXPECTED_ALGORITHM, getModelId(),
                     algorithmNode.asText());
         }
+    }
+
+    /**
+     * Returns whether the deployed model's {@code model_config.embedding_dimension}
+     * contradicts the configured {@value AbstractEmbeddingClient#EMBEDDING_DIMENSION_PROPERTY}.
+     *
+     * <p>This is the one live cross-check of the configured dimension against the model that
+     * actually serves the vectors. When they disagree, every returned vector is rejected by
+     * {@link #parsePredictResponse(String, int)}, so the mismatch is not a warning: reporting
+     * the model as unavailable makes the pre-flight gate skip the run and leave the documents
+     * pending, instead of burning through them one failure at a time. Logged at ERROR naming
+     * both numbers, since an operator reading only "provider unavailable" would look for an
+     * outage rather than a configuration mistake.</p>
+     *
+     * <p>Absence of evidence is not treated as a mismatch: a model document without a numeric
+     * {@code embedding_dimension}, or a locally unconfigured/invalid dimension (which
+     * {@link #getDimension()} reports by throwing), leaves the question unanswered and must not
+     * invent an outage.</p>
+     *
+     * @param modelNode the parsed model get response
+     * @return true when both dimensions are known and differ
+     */
+    protected boolean hasDimensionMismatch(final JsonNode modelNode) {
         final JsonNode dimensionNode = modelNode.path("model_config").path("embedding_dimension");
-        if (dimensionNode.isNumber()) {
-            try {
-                final int configuredDimension = getDimension();
-                if (dimensionNode.asInt() != configuredDimension) {
-                    logger.warn("[Embedding:OPENSEARCH] Model embedding dimension mismatch. modelId={}, model={}, configured={}",
-                            getModelId(), dimensionNode.asInt(), configuredDimension);
-                }
-            } catch (final EmbeddingException e) {
-                // The configured dimension is missing or invalid; this method is a
-                // diagnostic aid only, so do not let getDimension()'s validation
-                // failure break the availability check.
-                if (logger.isDebugEnabled()) {
-                    logger.debug("[Embedding:OPENSEARCH] Skipping dimension diagnostic. error={}", e.getMessage());
-                }
-            }
+        if (!dimensionNode.isNumber()) {
+            return false;
         }
+        final int configuredDimension;
+        try {
+            configuredDimension = getDimension();
+        } catch (final EmbeddingException e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("[Embedding:OPENSEARCH] Skipping dimension check. error={}", e.getMessage());
+            }
+            return false;
+        }
+        final int modelDimension = dimensionNode.asInt();
+        if (modelDimension == configuredDimension) {
+            return false;
+        }
+        logger.error(
+                "[Embedding:OPENSEARCH] Model embedding dimension does not match {}; reporting the model as unavailable so no "
+                        + "document is indexed with an unusable vector. modelId={}, model={}, configured={}",
+                EMBEDDING_DIMENSION_PROPERTY, getModelId(), modelDimension, configuredDimension);
+        return true;
     }
 
     @Override
@@ -516,10 +565,16 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
     /**
      * Gets the configured ML Commons model id. Required: a blank value makes
      * {@link #checkAvailabilityNow()} return false and embed calls throw
-     * {@link EmbeddingException}. Re-read on every call so the model can be
-     * swapped without a restart.
+     * {@link EmbeddingException}.
+     *
+     * <p>Read through {@link #getConfigString(String, String)} on every call, but that is
+     * <em>not</em> a live-reload seam: {@code FessConfigImpl} memoizes every
+     * {@code getOrDefault} lookup in an unbounded cache with no expiry, and the underlying
+     * {@code ObjectiveConfig.reloadIfNeeds()} only reloads under HotDeploy. Changing the model
+     * id requires a restart.</p>
      *
      * @return the configured model id, or blank when not configured
+     * @throws EmbeddingException if the configured value is non-blank but not a URL-safe token
      */
     protected String getModelId() {
         final String modelId = getConfigString(CONFIG_MODEL_ID, StringUtil.EMPTY);
@@ -609,7 +664,8 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
      * Gets the basic-auth username: the configured
      * {@code content_chunker.embedding.opensearch.username}, falling back to
      * fess core's search-engine username ({@code search_engine.username})
-     * since the default URL is the same cluster.
+     * <em>only</em> while {@link #isApiUrlConfigured() api.url is unconfigured},
+     * i.e. only while the target really is the same cluster.
      *
      * @return the resolved username, or blank when none is configured
      */
@@ -618,14 +674,14 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
         if (StringUtil.isNotBlank(value)) {
             return value;
         }
-        return ComponentUtil.getFessConfig().getFesenUsername();
+        return isApiUrlConfigured() ? StringUtil.EMPTY : ComponentUtil.getFessConfig().getFesenUsername();
     }
 
     /**
      * Gets the basic-auth password: the configured
      * {@code content_chunker.embedding.opensearch.password}, falling back to
      * fess core's search-engine password ({@code search_engine.password})
-     * since the default URL is the same cluster. Never logged.
+     * under the same condition as {@link #getUsername()}. Never logged.
      *
      * @return the resolved password, or blank when none is configured
      */
@@ -634,7 +690,29 @@ public class OpenSearchEmbeddingClient extends AbstractEmbeddingClient {
         if (StringUtil.isNotBlank(value)) {
             return value;
         }
-        return ComponentUtil.getFessConfig().getFesenPassword();
+        return isApiUrlConfigured() ? StringUtil.EMPTY : ComponentUtil.getFessConfig().getFesenPassword();
+    }
+
+    /**
+     * Returns whether {@code content_chunker.embedding.opensearch.api.url} is explicitly
+     * configured, i.e. whether this client may be pointed at a host other than the cluster
+     * fess core itself authenticates against.
+     *
+     * <p>This gates the {@code search_engine.username}/{@code search_engine.password}
+     * fallbacks in {@link #getUsername()}/{@link #getPassword()}. Those credentials are
+     * installed by {@link #buildHttpClient()} as a <em>preemptive</em>
+     * {@code Authorization: Basic} default header, so they are sent on the very first request
+     * to whatever {@link #getApiUrl()} resolved - a configured third-party {@code api.url}
+     * would receive the local cluster's credentials unprompted. The two fallbacks are checked
+     * independently for exactly this reason: configuring only
+     * {@code ...opensearch.username} must not leave the password inheriting the local secret.
+     * Point {@code api.url} elsewhere and you must configure that host's credentials
+     * explicitly, even if it happens to be the same cluster spelled differently.</p>
+     *
+     * @return true when api.url is explicitly configured
+     */
+    protected boolean isApiUrlConfigured() {
+        return StringUtil.isNotBlank(getConfigString(CONFIG_API_URL, StringUtil.EMPTY));
     }
 
     @Override

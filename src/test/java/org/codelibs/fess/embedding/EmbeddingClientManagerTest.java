@@ -153,6 +153,40 @@ public class EmbeddingClientManagerTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_embedDocuments_rejectsBlankElement() {
+        // Symmetric with embedQuery's blank guard: no client filters blank elements, and a blank
+        // chunk embeds to a meaningless vector that is then stored and searched against. Defensive:
+        // the stock LengthChunker cannot emit one, but an externally-written content array replayed
+        // by extractExistingChunks, or a third-party Chunker, can. The client is wired to return a
+        // perfectly good vector so the guard, not the client, must be what rejects it.
+        final FakeEmbeddingClient fake = new FakeEmbeddingClient("ollama");
+        fake.available = true;
+        fake.result = List.of(new float[] { 1.0f, 2.0f });
+        manager.register(fake);
+        manager.setTestEmbeddingType("ollama");
+        manager.setTestEnabled(true);
+        try {
+            manager.embedDocuments(List.of("chunk", "   "));
+            fail("expected EmbeddingException for a blank document element");
+        } catch (final EmbeddingException e) {
+            // expected
+        }
+    }
+
+    @Test
+    public void test_embedDocuments_delegatesEmptyListWithoutRejecting() {
+        // The blank-element guard must not turn a legitimately empty list (no chunks to embed)
+        // into a failure.
+        final FakeEmbeddingClient fake = new FakeEmbeddingClient("ollama");
+        fake.available = true;
+        fake.result = Collections.emptyList();
+        manager.register(fake);
+        manager.setTestEmbeddingType("ollama");
+        manager.setTestEnabled(true);
+        assertTrue(manager.embedDocuments(List.of()).isEmpty());
+    }
+
+    @Test
     public void test_embedQuery_delegatesToAvailableClientAndUnwrapsSingleResult() {
         final FakeEmbeddingClient fake = new FakeEmbeddingClient("ollama");
         fake.available = true;

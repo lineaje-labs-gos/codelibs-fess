@@ -51,6 +51,9 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
     /** The real config key read by the production (non-overridden) {@link OpenSearchEmbeddingClient#getDimension()}. */
     private static final String DIMENSION_CONFIG_KEY = "content_chunker.embedding.dimension";
 
+    /** The system-property key gating the whole content-chunking feature (and the availability check). */
+    private static final String CONTENT_CHUNKER_ENABLED_KEY = "content_chunker.enabled";
+
     /** The model id used by the testable client; part of the predict/model-get request paths. */
     private static final String TEST_MODEL_ID = "test-model";
 
@@ -780,13 +783,14 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_checkAvailabilityNow_warnsOnDimensionMismatch() throws Exception {
+    public void test_checkAvailabilityNow_dimensionMismatch_returnsFalseWithError() throws Exception {
         final MockWebServer server = new MockWebServer();
         final LogCapturingAppender capture = LogCapturingAppender.attach(OpenSearchEmbeddingClient.class);
         try {
-            // The model reports 384 dims but the configured dimension is 3: still
-            // available (diagnostic only), but the mismatch must be WARNed at check time
-            // instead of surfacing later as a per-embed dimension-mismatch failure.
+            // The deployed model reports 384 dims but content_chunker.embedding.dimension says 3.
+            // Every vector this model returns would be rejected by parsePredictResponse, so the
+            // pre-flight availability gate must fail closed and skip the run (leaving the documents
+            // pending) rather than let it proceed and fail per document.
             server.enqueue(new MockResponse().setBody(modelResponse("DEPLOYED", "TEXT_EMBEDDING", 384))
                     .setHeader("Content-Type", "application/json"));
             server.start();
@@ -795,12 +799,67 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
             client.setTestDimension(3);
             client.initHttpClient();
 
-            assertTrue(client.checkAvailabilityNow(), "the dimension diagnostic must not fail the availability check");
-            assertTrue(capture.warnings().stream().anyMatch(m -> m.contains("dimension") && m.contains("384") && m.contains("3")),
-                    "an embedding_dimension mismatch must emit a WARN carrying both values: " + capture.warnings());
+            assertFalse(client.checkAvailabilityNow(), "a model whose real dimension differs from the configured one must be unavailable");
+            assertTrue(capture.errors().stream().anyMatch(m -> m.contains("dimension") && m.contains("384") && m.contains("3")),
+                    "an embedding_dimension mismatch must emit an ERROR carrying both values so it does not read like an outage: "
+                            + capture.errors());
         } finally {
             capture.detach();
             server.shutdown();
+        }
+    }
+
+    @Test
+    public void test_isModelDeployed_dimensionMismatchIsUnavailable() {
+        client.setTestDimension(768);
+        assertFalse(client.isModelDeployed("{\"model_state\":\"DEPLOYED\",\"model_config\":{\"embedding_dimension\":384}}"),
+                "a DEPLOYED model whose embedding_dimension differs from the configured one must report unavailable");
+        assertTrue(client.isModelDeployed("{\"model_state\":\"DEPLOYED\",\"model_config\":{\"embedding_dimension\":768}}"),
+                "a DEPLOYED model whose embedding_dimension matches must report available");
+    }
+
+    @Test
+    public void test_isModelDeployed_absentOrUnreadableDimensionDoesNotFailClosed() {
+        // No model_config.embedding_dimension to compare against (or an unconfigured local
+        // dimension) means the mismatch is unknown, not proven -- do not invent an outage.
+        client.setTestDimension(768);
+        assertTrue(client.isModelDeployed("{\"model_state\":\"DEPLOYED\",\"model_config\":{\"model_type\":\"bert\"}}"),
+                "a model document without embedding_dimension must not be forced unavailable");
+        client.setTestDimension(null);
+        assertTrue(client.isModelDeployed("{\"model_state\":\"DEPLOYED\",\"model_config\":{\"embedding_dimension\":384}}"),
+                "an unconfigured local dimension must not be forced unavailable by the dimension gate");
+    }
+
+    // ========== init() must never abort container startup ==========
+
+    @Test
+    public void test_init_invalidModelId() throws Exception {
+        // BLOCKER: init() runs from the container's init-method assembler; a RuntimeException here
+        // aborts Tomcat context startup. A malformed content_chunker.embedding.opensearch.model.id
+        // (e.g. the "huggingface/..." model NAME pasted in place of the generated id) makes
+        // getModelId() throw an EmbeddingException from inside checkAvailabilityNow(), so a single
+        // config typo used to make Fess unbootable and unrecoverable without editing the file.
+        final String oldEnabled = ComponentUtil.getSystemProperties().getProperty(CONTENT_CHUNKER_ENABLED_KEY);
+        ComponentUtil.getSystemProperties().setProperty(CONTENT_CHUNKER_ENABLED_KEY, "true");
+        client.setTestModelIdRaw("huggingface/all-MiniLM-L6-v2");
+        try {
+            client.init();
+        } catch (final RuntimeException e) {
+            fail("a malformed model.id must not propagate out of init() and abort container startup: " + e);
+        } finally {
+            if (oldEnabled == null) {
+                ComponentUtil.getSystemProperties().remove(CONTENT_CHUNKER_ENABLED_KEY);
+            } else {
+                ComponentUtil.getSystemProperties().setProperty(CONTENT_CHUNKER_ENABLED_KEY, oldEnabled);
+            }
+        }
+        assertFalse(client.isAvailable(), "a client with a malformed model.id must report unavailable, not rethrow");
+        // The validation itself must stay intact: the id is still rejected when read directly.
+        try {
+            client.getModelId();
+            fail("getModelId() must still reject a malformed model id");
+        } catch (final EmbeddingException e) {
+            assertTrue(e.getMessage().contains("model.id"), "message should name the offending key: " + e.getMessage());
         }
     }
 
@@ -857,6 +916,177 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
             final RecordedRequest recordedRequest = takeRequest(server);
             assertNull(recordedRequest.getHeader("Authorization"), "no Authorization header should be sent without credentials");
         } finally {
+            server.shutdown();
+        }
+    }
+
+    // ========== Credential inheritance from fess core's search-engine settings ==========
+    //
+    // getUsername()/getPassword() fall back to search_engine.username/password because the
+    // DEFAULT api.url is fess core's own cluster. buildHttpClient() installs the result as a
+    // PREEMPTIVE Authorization: Basic default header, so it is sent on the very first request to
+    // whatever getApiUrl() resolved. The fallback must therefore be conditional on api.url NOT
+    // being explicitly configured, or a third-party api.url receives the local cluster's
+    // credentials unprompted. Note the two fallbacks are independent, so the leak also has to be
+    // closed for the "provider username set, provider password unset" combination.
+    //
+    // These tests use a plain OpenSearchEmbeddingClient (the Testable subclass overrides both
+    // getters, so it never exercises the fallback in either direction) driven through a FessConfig
+    // stub that reports distinct local-cluster credentials.
+
+    /** The real config key read by the production {@link OpenSearchEmbeddingClient#getModelId()}. */
+    private static final String MODEL_ID_CONFIG_KEY = "content_chunker.embedding.opensearch.model.id";
+
+    /** The real config key for the provider-specific basic-auth username. */
+    private static final String USERNAME_CONFIG_KEY = "content_chunker.embedding.opensearch.username";
+
+    /** fess core's own search-engine credentials, which must never reach a third-party api.url. */
+    private static final String LOCAL_CLUSTER_USERNAME = "local-cluster-admin";
+    private static final String LOCAL_CLUSTER_PASSWORD = "local-cluster-secret";
+
+    /**
+     * Installs a FessConfig stub reporting {@link #LOCAL_CLUSTER_USERNAME}/{@link #LOCAL_CLUSTER_PASSWORD}
+     * as fess core's search-engine credentials, {@code apiUrlValue} as the configured api.url
+     * (null = unconfigured), {@link #TEST_MODEL_ID} as the model id, and {@code providerUsername}
+     * as the provider-specific username (null = unconfigured).
+     */
+    private FessConfig installCredentialFessConfigStub(final String apiUrlValue, final String providerUsername) {
+        final FessConfig original = ComponentUtil.getFessConfig();
+        ComponentUtil.setFessConfig(new FessConfig.SimpleImpl() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public String getOrDefault(final String key, final String defaultValue) {
+                if (API_URL_CONFIG_KEY.equals(key) && apiUrlValue != null) {
+                    return apiUrlValue;
+                }
+                if (MODEL_ID_CONFIG_KEY.equals(key)) {
+                    return TEST_MODEL_ID;
+                }
+                if (USERNAME_CONFIG_KEY.equals(key) && providerUsername != null) {
+                    return providerUsername;
+                }
+                return defaultValue;
+            }
+
+            @Override
+            public String getSearchEngineUsername() {
+                return LOCAL_CLUSTER_USERNAME;
+            }
+
+            @Override
+            public String getSearchEnginePassword() {
+                return LOCAL_CLUSTER_PASSWORD;
+            }
+
+            @Override
+            public String getHttpProxyHost() {
+                return "";
+            }
+
+            @Override
+            public Integer getHttpProxyPortAsInteger() {
+                return null;
+            }
+        });
+        return original;
+    }
+
+    /** base64("user:password") as the preemptive basic-auth header value. */
+    private static String basicHeader(final String username, final String password) {
+        return "Basic " + java.util.Base64.getEncoder()
+                .encodeToString((username + ":" + password).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    @Test
+    public void test_credentials_notInheritedWhenApiUrlOverridden() throws Exception {
+        final MockWebServer server = new MockWebServer();
+        server.enqueue(
+                new MockResponse().setBody(modelResponse("DEPLOYED", "TEXT_EMBEDDING", 384)).setHeader("Content-Type", "application/json"));
+        server.start();
+        // An explicitly configured api.url may point anywhere; treat it as third-party.
+        final FessConfig original = installCredentialFessConfigStub(server.url("").toString().replaceAll("/$", ""), null);
+        ComponentUtil.getSystemProperties().setProperty(DIMENSION_CONFIG_KEY, "384");
+        try {
+            final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+            try {
+                assertTrue(org.codelibs.core.lang.StringUtil.isBlank(realClient.getUsername()),
+                        "search_engine.username must not be inherited by an explicitly configured api.url: " + realClient.getUsername());
+                assertTrue(org.codelibs.core.lang.StringUtil.isBlank(realClient.getPassword()),
+                        "search_engine.password must not be inherited by an explicitly configured api.url");
+
+                assertTrue(realClient.checkAvailabilityNow());
+                final RecordedRequest recordedRequest = takeRequest(server);
+                assertEquals(MODEL_GET_PATH, recordedRequest.getPath());
+                assertNull(recordedRequest.getHeader("Authorization"),
+                        "no Authorization header may be sent to an explicitly configured (possibly third-party) api.url");
+            } finally {
+                realClient.destroy();
+            }
+        } finally {
+            ComponentUtil.getSystemProperties().remove(DIMENSION_CONFIG_KEY);
+            ComponentUtil.setFessConfig(original);
+            server.shutdown();
+        }
+    }
+
+    @Test
+    public void test_credentials_providerUsernameOnly_doesNotShipLocalPasswordToExternalHost() throws Exception {
+        // The two fallbacks are independent: setting only the provider username must not leave the
+        // password falling back to the local cluster's secret.
+        final MockWebServer server = new MockWebServer();
+        server.enqueue(
+                new MockResponse().setBody(modelResponse("DEPLOYED", "TEXT_EMBEDDING", 384)).setHeader("Content-Type", "application/json"));
+        server.start();
+        final FessConfig original = installCredentialFessConfigStub(server.url("").toString().replaceAll("/$", ""), "extuser");
+        ComponentUtil.getSystemProperties().setProperty(DIMENSION_CONFIG_KEY, "384");
+        try {
+            final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+            try {
+                assertEquals("extuser", realClient.getUsername());
+                assertTrue(org.codelibs.core.lang.StringUtil.isBlank(realClient.getPassword()),
+                        "search_engine.password must not pair with a provider-supplied username on an external api.url");
+
+                assertTrue(realClient.checkAvailabilityNow());
+                assertNull(takeRequest(server).getHeader("Authorization"),
+                        "a half-configured credential pair must not ship the local cluster's password");
+            } finally {
+                realClient.destroy();
+            }
+        } finally {
+            ComponentUtil.getSystemProperties().remove(DIMENSION_CONFIG_KEY);
+            ComponentUtil.setFessConfig(original);
+            server.shutdown();
+        }
+    }
+
+    @Test
+    public void test_credentials_inheritedWhenApiUrlNotConfigured() throws Exception {
+        // The default target IS fess core's own cluster, so inheriting its credentials there is the
+        // intended behaviour and must be preserved.
+        final MockWebServer server = new MockWebServer();
+        server.enqueue(
+                new MockResponse().setBody(modelResponse("DEPLOYED", "TEXT_EMBEDDING", 384)).setHeader("Content-Type", "application/json"));
+        server.start();
+        final FessConfig original = installCredentialFessConfigStub(null, null);
+        final String oldAddress = System.getProperty(SEARCH_ENGINE_ADDRESS_PROPERTY);
+        System.setProperty(SEARCH_ENGINE_ADDRESS_PROPERTY, server.url("").toString().replaceAll("/$", ""));
+        ComponentUtil.getSystemProperties().setProperty(DIMENSION_CONFIG_KEY, "384");
+        try {
+            final OpenSearchEmbeddingClient realClient = new OpenSearchEmbeddingClient();
+            try {
+                assertEquals(LOCAL_CLUSTER_USERNAME, realClient.getUsername());
+                assertEquals(LOCAL_CLUSTER_PASSWORD, realClient.getPassword());
+
+                assertTrue(realClient.checkAvailabilityNow());
+                assertEquals(basicHeader(LOCAL_CLUSTER_USERNAME, LOCAL_CLUSTER_PASSWORD), takeRequest(server).getHeader("Authorization"));
+            } finally {
+                realClient.destroy();
+            }
+        } finally {
+            ComponentUtil.getSystemProperties().remove(DIMENSION_CONFIG_KEY);
+            restoreSystemProperty(SEARCH_ENGINE_ADDRESS_PROPERTY, oldAddress);
+            ComponentUtil.setFessConfig(original);
             server.shutdown();
         }
     }
@@ -1351,6 +1581,10 @@ public class OpenSearchEmbeddingClientTest extends UnitFessTestCase {
 
         List<String> warnings() {
             return messagesAt(Level.WARN);
+        }
+
+        List<String> errors() {
+            return messagesAt(Level.ERROR);
         }
     }
 }

@@ -223,18 +223,56 @@ public abstract class AbstractEmbeddingClient implements EmbeddingClient {
     }
 
     /**
-     * Updates the cached availability state.
+     * Updates the cached availability state, never propagating a failure.
+     *
+     * <p>Both callers make propagation unacceptable. {@link #startAvailabilityCheck()} runs
+     * from {@link #init()}, which the container invokes as an eager, unconditional init-method
+     * during singleton assembly; a {@link RuntimeException} escaping it is rethrown all the way
+     * out of {@code LastaPrepareFilter} and aborts Tomcat context startup. And
+     * {@link #checkAvailabilityNow()} legitimately reads operator configuration (e.g. the
+     * OpenSearch provider validates {@code ...opensearch.model.id}), so a single typo in
+     * {@code fess_config.properties} would otherwise make Fess unbootable. The other caller is
+     * the {@link TimeoutManager} thread, where an escaping exception would silently kill the
+     * periodic check. A failed probe means "unavailable", never "do not start".</p>
      */
     protected void updateAvailability() {
-        cachedAvailability = checkAvailabilityNow();
+        cachedAvailability = checkAvailabilitySafely();
     }
 
     @Override
     public boolean isAvailable() {
-        if (cachedAvailability != null) {
-            return cachedAvailability;
+        Boolean cached = cachedAvailability;
+        if (cached == null) {
+            // The periodic check is started only from init(), and startAvailabilityCheck()
+            // early-returns while content chunking is disabled. Enabling the feature after boot
+            // would therefore leave the cache empty forever (init() is never re-run: both
+            // implementations assign httpClient before calling startAvailabilityCheck(), so
+            // getHttpClient()'s lazy path never fires again), making every caller -- i.e. every
+            // search request via EmbeddingClientManager.available() -- pay a synchronous provider
+            // probe. Start it once here instead. Still a no-op while the feature is disabled.
+            synchronized (this) {
+                if (cachedAvailability == null && availabilityCheckTask == null) {
+                    startAvailabilityCheck();
+                }
+                cached = cachedAvailability;
+            }
         }
-        return checkAvailabilityNow();
+        return cached != null ? cached : checkAvailabilitySafely();
+    }
+
+    /**
+     * Runs {@link #checkAvailabilityNow()} and reports "unavailable" instead of propagating a
+     * {@link RuntimeException}. See {@link #updateAvailability()} for why nothing here may throw.
+     *
+     * @return the probe result, or false when the probe itself failed
+     */
+    private boolean checkAvailabilitySafely() {
+        try {
+            return checkAvailabilityNow();
+        } catch (final RuntimeException e) {
+            logger.warn("[Embedding] {} availability check failed; reporting unavailable.", getName(), e);
+            return false;
+        }
     }
 
     /**
