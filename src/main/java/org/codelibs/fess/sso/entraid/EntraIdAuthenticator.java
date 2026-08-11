@@ -469,7 +469,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
         storeStateInSession(request.getSession(), state, nonce);
 
         final String responseMode = getResponseMode();
-        final String authUrl = getAuthority() + getTenant() + "/oauth2/v2.0/authorize?response_type=code&scope="
+        final String authUrl = getTenantAuthority() + "/oauth2/v2.0/authorize?response_type=code&scope="
                 + URLEncoder.encode(V2_SCOPES, Constants.UTF_8_CHARSET) + "&response_mode=" + responseMode + "&redirect_uri="
                 + URLEncoder.encode(getReplyUrl(request), Constants.UTF_8_CHARSET) + "&client_id=" + getClientId() + "&state=" + state
                 + "&nonce=" + nonce;
@@ -701,7 +701,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             }
             final String clientId = getClientId();
             final String clientSecret = getClientSecret();
-            final String authority = getAuthority() + getTenant() + "/";
+            final String authority = getTenantAuthority() + "/";
             if (logger.isDebugEnabled()) {
                 logger.debug("Building a client application for authority={}", authority);
             }
@@ -725,7 +725,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      * @return The key.
      */
     protected String buildClientApplicationKey() {
-        return buildClientApplicationKey(getClientId(), getClientSecret(), getAuthority() + getTenant() + "/");
+        return buildClientApplicationKey(getClientId(), getClientSecret(), getTenantAuthority() + "/");
     }
 
     /**
@@ -786,7 +786,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      * @return The authentication result containing the access token.
      */
     public IAuthenticationResult getAccessToken(final String refreshToken) {
-        final String authority = getAuthority() + getTenant() + "/";
+        final String authority = getTenantAuthority() + "/";
         if (logger.isDebugEnabled()) {
             logger.debug("refreshToken={}, authority={}", maskSecret(refreshToken), authority);
         }
@@ -813,7 +813,7 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      * @return The authentication result containing the access token.
      */
     protected IAuthenticationResult getAccessToken(final AuthorizationCode authorizationCode, final String currentUri) {
-        final String authority = getAuthority() + getTenant() + "/";
+        final String authority = getTenantAuthority() + "/";
         final String authCode = authorizationCode.getValue();
         if (logger.isDebugEnabled()) {
             logger.debug("authCode={}, authority={}, uri={}", maskSecret(authCode), authority, currentUri);
@@ -1723,6 +1723,36 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             return DEFAULT_AUTHORITY;
         }
         return value;
+    }
+
+    /**
+     * Joins {@link #getAuthority()} and {@link #getTenant()} with exactly one {@code /} between
+     * them.
+     * <p>
+     * {@link #DEFAULT_AUTHORITY} ends with a slash, but a value an admin types into
+     * {@code entraid.authority} usually does not -- {@code https://login.microsoftonline.com} is
+     * how the endpoint is written everywhere it is documented. Concatenating that with the tenant
+     * fuses the host and the tenant into one bogus hostname
+     * ({@code https://login.microsoftonline.comcontoso.onmicrosoft.com}), so the browser gets
+     * NXDOMAIN on the redirect and the authorization URL is only logged at debug level. A tenant
+     * that starts with a slash is already correct against a slashless authority, so a separator is
+     * inserted only when neither side supplies one, and a doubled separator is collapsed.
+     * <p>
+     * A blank tenant gets no separator at all: the callers append their own {@code /} after this
+     * value, and inserting one here would turn today's output into a doubled slash.
+     *
+     * @return The authority URL followed by the tenant, separated by a single {@code /}.
+     */
+    protected String getTenantAuthority() {
+        final String authority = getAuthority();
+        final String tenant = getTenant();
+        if (StringUtil.isEmpty(tenant)) {
+            return authority;
+        }
+        if (authority.endsWith("/")) {
+            return tenant.startsWith("/") ? authority + tenant.substring(1) : authority + tenant;
+        }
+        return tenant.startsWith("/") ? authority + tenant : authority + "/" + tenant;
     }
 
     /**
