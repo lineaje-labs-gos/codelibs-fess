@@ -311,6 +311,20 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
     protected int maxGroupDepth = 10;
 
     /**
+     * Number of consecutive unanswered parent group lookups after which the walk gives up.
+     *
+     * <p>A Microsoft Graph that answers {@code /me/memberOf} and then fails every
+     * {@code getMemberGroups} -- a 500, a 502, a 504, a DNS or connection failure, or
+     * {@link #graphConnectTimeout}/{@link #graphReadTimeout} expiring -- would otherwise cost one
+     * request per direct group on every single login, each of them waiting out the timeouts, on
+     * the shared {@link TimeoutManager} pool.
+     *
+     * <p>Consecutive rather than total is deliberate: one group that is permanently broken must
+     * not stop the rest of the walk, while a Graph nobody can reach trips the bound at once.
+     */
+    protected int maxConsecutiveGroupLookupFailures = 3;
+
+    /**
      * Connection timeout for Microsoft Graph requests in milliseconds. curl4j leaves this unset,
      * which means an unbounded wait, and the direct-membership lookup runs on the login thread.
      */
@@ -1200,56 +1214,91 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             logger.debug("[scheduleParentGroupLookup] Scheduling async parent group lookup for user: {}, groupIds count: {}",
                     user.getName(), groupIds.size());
         }
-        TimeoutManager.getInstance().addTimeoutTarget(() -> {
+        TimeoutManager.getInstance().addTimeoutTarget(() -> runParentGroupLookup(user, initialGroups, initialRoles, groupIds), 0, false);
+    }
+
+    /**
+     * Walks the parent groups of every collected group ID and applies the result to the user.
+     *
+     * <p>This is the body {@link #scheduleParentGroupLookup} hands to {@link TimeoutManager}, kept
+     * separate so that the walk is reachable without a timer thread.
+     *
+     * <p>The walk stops after {@link #maxConsecutiveGroupLookupFailures} consecutive lookups that
+     * Microsoft Graph did not answer. Whatever was collected before that is still applied: a
+     * partial set of nested groups is what 15.7 and 15.8 already hand out when a lookup fails, and
+     * dropping it would take permissions away from a user who had them a minute earlier.
+     *
+     * @param user The Entra ID user.
+     * @param initialGroups The groups resolved from the direct membership lookup.
+     * @param initialRoles The roles resolved from the direct membership lookup.
+     * @param groupIds The group IDs to look up parent groups for.
+     */
+    protected void runParentGroupLookup(final EntraIdUser user, final List<String> initialGroups, final List<String> initialRoles,
+            final List<String> groupIds) {
+        if (logger.isDebugEnabled()) {
+            logger.debug("[scheduleParentGroupLookup] Async task started for user: {}", user.getName());
+        }
+        final long startTime = System.currentTimeMillis();
+        try {
+            final List<String> updatedGroups = new ArrayList<>(initialGroups);
+            final List<String> updatedRoles = new ArrayList<>(initialRoles);
+
             if (logger.isDebugEnabled()) {
-                logger.debug("[scheduleParentGroupLookup] Async task started for user: {}", user.getName());
+                logger.debug("[scheduleParentGroupLookup] Processing {} group IDs for parent lookup", groupIds.size());
             }
-            final long startTime = System.currentTimeMillis();
-            try {
-                final List<String> updatedGroups = new ArrayList<>(initialGroups);
-                final List<String> updatedRoles = new ArrayList<>(initialRoles);
 
+            int processedCount = 0;
+            int consecutiveFailures = 0;
+            int failureCount = 0;
+            for (final String groupId : groupIds) {
+                // Counted outside the debug guard: the WARN below reports how many were left.
+                ++processedCount;
                 if (logger.isDebugEnabled()) {
-                    logger.debug("[scheduleParentGroupLookup] Processing {} group IDs for parent lookup", groupIds.size());
+                    logger.debug("[scheduleParentGroupLookup] Processing parent groups for groupId: {} ({}/{})", groupId, processedCount,
+                            groupIds.size());
                 }
-
-                int processedCount = 0;
-                for (final String groupId : groupIds) {
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("[scheduleParentGroupLookup] Processing parent groups for groupId: {} ({}/{})", groupId,
-                                ++processedCount, groupIds.size());
+                // Only the first failure of this walk is worth a stack trace; the rest would bury it.
+                if (processParentGroup(user, updatedGroups, updatedRoles, groupId, 0, failureCount == 0)) {
+                    consecutiveFailures = 0;
+                } else {
+                    ++failureCount;
+                    if (++consecutiveFailures >= maxConsecutiveGroupLookupFailures) {
+                        logger.warn(
+                                "Stopped resolving nested groups for user {} after {} consecutive Microsoft Graph failures."
+                                        + " {} of {} groups were not walked.",
+                                user.getName(), consecutiveFailures, groupIds.size() - processedCount, groupIds.size());
+                        break;
                     }
-                    processParentGroup(user, updatedGroups, updatedRoles, groupId);
                 }
-
-                // Update groups/roles
-                final String[] finalGroups = updatedGroups.stream().distinct().toArray(n -> new String[n]);
-                final String[] finalRoles = updatedRoles.stream().distinct().toArray(n -> new String[n]);
-                user.setGroups(finalGroups);
-                user.setRoles(finalRoles);
-
-                // Reset permissions to force recalculation
-                user.resetPermissions();
-
-                final long elapsedTime = System.currentTimeMillis() - startTime;
-                if (logger.isDebugEnabled()) {
-                    logger.debug(
-                            "[scheduleParentGroupLookup] Async task completed for user: {}. Final groups: {}, Final roles: {}, Elapsed time: {}ms",
-                            user.getName(), finalGroups.length, finalRoles.length, elapsedTime);
-                    logger.debug("[scheduleParentGroupLookup] Final groups for user {}: {}", user.getName(), Arrays.toString(finalGroups));
-                    logger.debug("[scheduleParentGroupLookup] Final roles for user {}: {}", user.getName(), Arrays.toString(finalRoles));
-                }
-
-                // Update session information
-                if (logger.isDebugEnabled()) {
-                    logger.debug("[scheduleParentGroupLookup] Notifying permission change for user: {}", user.getName());
-                }
-                ComponentUtil.getActivityHelper().permissionChanged(OptionalThing.of(new FessUserBean(user)));
-            } catch (final Exception e) {
-                final long elapsedTime = System.currentTimeMillis() - startTime;
-                logger.warn("Failed to process parent groups asynchronously for user: {} after {}ms", user.getName(), elapsedTime, e);
             }
-        }, 0, false);
+
+            // Update groups/roles
+            final String[] finalGroups = updatedGroups.stream().distinct().toArray(n -> new String[n]);
+            final String[] finalRoles = updatedRoles.stream().distinct().toArray(n -> new String[n]);
+            user.setGroups(finalGroups);
+            user.setRoles(finalRoles);
+
+            // Reset permissions to force recalculation
+            user.resetPermissions();
+
+            final long elapsedTime = System.currentTimeMillis() - startTime;
+            if (logger.isDebugEnabled()) {
+                logger.debug(
+                        "[scheduleParentGroupLookup] Async task completed for user: {}. Final groups: {}, Final roles: {}, Elapsed time: {}ms",
+                        user.getName(), finalGroups.length, finalRoles.length, elapsedTime);
+                logger.debug("[scheduleParentGroupLookup] Final groups for user {}: {}", user.getName(), Arrays.toString(finalGroups));
+                logger.debug("[scheduleParentGroupLookup] Final roles for user {}: {}", user.getName(), Arrays.toString(finalRoles));
+            }
+
+            // Update session information
+            if (logger.isDebugEnabled()) {
+                logger.debug("[scheduleParentGroupLookup] Notifying permission change for user: {}", user.getName());
+            }
+            ComponentUtil.getActivityHelper().permissionChanged(OptionalThing.of(new FessUserBean(user)));
+        } catch (final Exception e) {
+            final long elapsedTime = System.currentTimeMillis() - startTime;
+            logger.warn("Failed to process parent groups asynchronously for user: {} after {}ms", user.getName(), elapsedTime, e);
+        }
     }
 
     /**
@@ -1258,9 +1307,11 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      * @param groupList The list to add group names to.
      * @param roleList The list to add role names to.
      * @param id The group ID to process.
+     * @return True when the lookup was answered, false when Microsoft Graph did not answer it.
      */
-    protected void processParentGroup(final EntraIdUser user, final List<String> groupList, final List<String> roleList, final String id) {
-        processParentGroup(user, groupList, roleList, id, 0);
+    protected boolean processParentGroup(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
+            final String id) {
+        return processParentGroup(user, groupList, roleList, id, 0);
     }
 
     /**
@@ -1270,9 +1321,34 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      * @param roleList The list to add role names to.
      * @param id The group ID to process.
      * @param depth The current recursion depth.
+     * @return True when the lookup was answered, false when Microsoft Graph did not answer it.
      */
-    protected void processParentGroup(final EntraIdUser user, final List<String> groupList, final List<String> roleList, final String id,
+    protected boolean processParentGroup(final EntraIdUser user, final List<String> groupList, final List<String> roleList, final String id,
             final int depth) {
+        return processParentGroup(user, groupList, roleList, id, depth, true);
+    }
+
+    /**
+     * Processes parent group information for nested groups with depth tracking.
+     *
+     * <p>The boolean result is what bounds {@link #runParentGroupLookup}: false means Microsoft
+     * Graph did not answer, and enough of those in a row stop the walk. Everything Graph did
+     * answer counts as true, including the depth limit, an empty parent list and the skip
+     * {@link #getParentGroup} performs while Graph is throttling -- none of those is a reason to
+     * stop asking about the remaining groups.
+     *
+     * @param user The Entra ID user.
+     * @param groupList The list to add group names to.
+     * @param roleList The list to add role names to.
+     * @param id The group ID to process.
+     * @param depth The current recursion depth.
+     * @param logStackTrace Whether a failure may be logged with its stack trace. The walk passes
+     *            true for the first failure only, so that a Graph outage costs one stack trace
+     *            rather than one per group.
+     * @return True when the lookup was answered, false when Microsoft Graph did not answer it.
+     */
+    protected boolean processParentGroup(final EntraIdUser user, final List<String> groupList, final List<String> roleList, final String id,
+            final int depth, final boolean logStackTrace) {
         if (logger.isDebugEnabled()) {
             logger.debug("[processParentGroup] Processing parent groups for id: {}, depth: {}/{}", id, depth, maxGroupDepth);
         }
@@ -1280,23 +1356,51 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             if (logger.isDebugEnabled()) {
                 logger.debug("[processParentGroup] Maximum group depth {} reached for group {}", maxGroupDepth, id);
             }
-            return;
+            return true;
         }
-        final Pair<String[], String[]> groupsAndRoles = getParentGroup(user, id, depth);
+        final Pair<String[], String[]> groupsAndRoles;
+        try {
+            groupsAndRoles = getParentGroup(user, id, depth);
+        } catch (final ParentGroupLookupException e) {
+            // A throttled Graph already stated its reason in the single WARN that set the backoff,
+            // so it never gets a stack trace here either.
+            if (logStackTrace && !isGraphThrottled()) {
+                logger.warn("Failed to process group cache for id: {}", id, e);
+            } else {
+                logger.warn("Failed to process group cache for id {}: {}", id, e.getCause());
+            }
+            return false;
+        }
         StreamUtil.stream(groupsAndRoles.getFirst()).of(stream -> stream.forEach(groupList::add));
         StreamUtil.stream(groupsAndRoles.getSecond()).of(stream -> stream.forEach(roleList::add));
         if (logger.isDebugEnabled()) {
             logger.debug("[processParentGroup] Completed for id: {}, depth: {}, added groups: {}, added roles: {}", id, depth,
                     groupsAndRoles.getFirst().length, groupsAndRoles.getSecond().length);
         }
+        return true;
     }
 
     /**
      * Retrieves parent group information for the specified group ID with depth tracking.
+     *
+     * <p>An empty pair is an answer, not a failure: it is what the depth limit, a group with no
+     * parents and the skip performed while Microsoft Graph is throttling all hand back. A lookup
+     * Graph did not answer is raised as {@link ParentGroupLookupException} instead, so that
+     * {@link #runParentGroupLookup} can tell the two apart and stop walking a Graph that has
+     * stopped answering.
+     *
+     * <p>The recursive call in {@link #loadParentGroup} means that exception can also travel out
+     * of the cache loader, so the <em>outer</em> group ID is left uncached when a nested lookup
+     * fails. That is the same rule #3223 established for the group itself: a transient failure is
+     * never pinned in {@link #groupCache} for the whole TTL. In practice the recursion is only
+     * reachable when {@code processGroup} threw, because on every other path it adds the ID it was
+     * given and the {@code !groupList.contains(value)} guard is false.
+     *
      * @param user The Entra ID user.
      * @param id The group ID to get parent information for.
      * @param depth The current recursion depth.
      * @return A pair containing group names and role names.
+     * @throws ParentGroupLookupException If Microsoft Graph did not answer the lookup.
      */
     protected Pair<String[], String[]> getParentGroup(final EntraIdUser user, final String id, final int depth) {
         if (logger.isDebugEnabled()) {
@@ -1337,14 +1441,12 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
             // briefly unreachable Graph must not pin an empty result for the whole cache TTL.
             // UncheckedExecutionException matters because the Graph JSON parser throws
             // CurlException, a RuntimeException, on a non-JSON error body.
-            if (isGraphThrottled()) {
-                // The reason is already stated by the single WARN that set the throttle; a stack
-                // trace per group would bury it.
-                logger.warn("Failed to process group cache for id {} while Microsoft Graph is throttling: {}", id, e.getMessage());
-            } else {
-                logger.warn("Failed to process group cache for id: {}", id, e);
-            }
-            return new Pair<>(StringUtil.EMPTY_STRINGS, StringUtil.EMPTY_STRINGS);
+            //
+            // Handing back an empty pair here is what let the walk run to completion against a
+            // Graph that had stopped answering: one request and one stack trace per direct group,
+            // each waiting out graphConnectTimeout/graphReadTimeout, on every login. The caller
+            // logs this and counts it instead.
+            throw new ParentGroupLookupException("Failed to look up the parent groups of " + id, e);
         }
     }
 
@@ -1824,6 +1926,14 @@ public class EntraIdAuthenticator implements SsoAuthenticator {
      */
     public void setMaxGroupDepth(final int maxGroupDepth) {
         this.maxGroupDepth = maxGroupDepth;
+    }
+
+    /**
+     * Sets how many consecutive unanswered parent group lookups end the walk.
+     * @param maxConsecutiveGroupLookupFailures The number of consecutive failures to tolerate.
+     */
+    public void setMaxConsecutiveGroupLookupFailures(final int maxConsecutiveGroupLookupFailures) {
+        this.maxConsecutiveGroupLookupFailures = maxConsecutiveGroupLookupFailures;
     }
 
     @Override

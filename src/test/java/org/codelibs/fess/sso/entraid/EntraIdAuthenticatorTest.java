@@ -38,6 +38,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.LogEvent;
 import org.codelibs.core.misc.Pair;
 import org.codelibs.curl.Curl;
 import org.codelibs.curl.CurlResponse;
@@ -46,12 +48,14 @@ import org.codelibs.fess.app.web.base.login.EntraIdCredential.EntraIdUser;
 import org.codelibs.fess.app.web.base.login.EntraIdCredential;
 import org.codelibs.fess.exception.SsoLoginException;
 import org.codelibs.fess.exception.SsoStateException;
+import org.codelibs.fess.helper.ActivityHelper;
 import org.codelibs.fess.helper.SystemHelper;
 import org.codelibs.fess.mylasta.action.FessUserBean;
 import org.codelibs.fess.mylasta.direction.FessConfig;
 import org.codelibs.fess.unit.LogCapturingAppender;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.codelibs.fess.util.ComponentUtil;
+import org.dbflute.optional.OptionalThing;
 import org.dbflute.utflute.mocklet.MockletHttpServletRequest;
 import org.junit.jupiter.api.Test;
 import org.lastaflute.web.login.credential.LoginCredential;
@@ -63,6 +67,7 @@ import jakarta.servlet.http.HttpSession;
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.microsoft.aad.msal4j.ConfidentialClientApplication;
 import com.microsoft.aad.msal4j.IAccount;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
@@ -901,14 +906,21 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_getParentGroup_doesNotCacheAFailedLookup() {
+    public void test_getParentGroup_reportsAFailedLookupAndDoesNotCacheIt() {
         // A throttled or briefly unreachable Graph used to leave an empty result in the cache,
         // so the user silently lost their parent-group permissions for the whole cache TTL.
+        // Nothing is cached, and the failure is raised rather than flattened into an empty pair:
+        // an empty pair is indistinguishable from "this group has no parents", which is what let
+        // the walk keep going against a Graph that had stopped answering.
         final ScriptedAuthenticator authenticator = newScriptedAuthenticator();
         authenticator.failing.add("group-a");
 
-        final Pair<String[], String[]> failed = authenticator.getParentGroup(null, "group-a", 0);
-        assertEquals(0, failed.getFirst().length);
+        try {
+            authenticator.getParentGroup(null, "group-a", 0);
+            fail("expected ParentGroupLookupException");
+        } catch (final ParentGroupLookupException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("group-a"));
+        }
         assertNull(authenticator.groupCache.getIfPresent("group-a"));
 
         authenticator.failing.remove("group-a");
@@ -950,10 +962,12 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_getParentGroup_survivesAnUncheckedFailureFromTheLoader() {
+    public void test_getParentGroup_reportsAnUncheckedFailureFromTheLoader() {
         // Guava wraps an unchecked exception from the loader in UncheckedExecutionException,
         // which is not an ExecutionException, so it used to escape the catch entirely. The Graph
-        // JSON parser throws CurlException, a RuntimeException, on a non-JSON error body.
+        // JSON parser throws CurlException, a RuntimeException, on a non-JSON error body. It has
+        // to reach the same reported-and-counted path as a checked failure, or a Graph that
+        // answers with a non-JSON 500 body would still be walked once per group.
         final EntraIdAuthenticator authenticator = new EntraIdAuthenticator() {
             @Override
             protected String[] getMemberGroupIds(final EntraIdUser user, final String id) {
@@ -962,10 +976,12 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         };
         authenticator.groupCache = CacheBuilder.newBuilder().build();
 
-        final Pair<String[], String[]> result = authenticator.getParentGroup(null, "group-a", 0);
-
-        assertEquals(0, result.getFirst().length);
-        assertEquals(0, result.getSecond().length);
+        try {
+            authenticator.getParentGroup(null, "group-a", 0);
+            fail("expected ParentGroupLookupException");
+        } catch (final ParentGroupLookupException e) {
+            assertTrue(e.getCause().getClass().getName(), e.getCause() instanceof UncheckedExecutionException);
+        }
         assertNull(authenticator.groupCache.getIfPresent("group-a"));
     }
 
@@ -1075,6 +1091,172 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         authenticator.graphThrottledUntil = clock.get() + 60_000L;
 
         assertEquals(1, authenticator.getParentGroup(null, "group-a", 0).getFirst().length);
+    }
+
+    /**
+     * The walk ends by telling the session its permissions changed, and the test container has no
+     * activityHelper, so without this the last statement throws {@code ComponentNotFoundException}
+     * into the task's catch(Exception) and every walk test would silently stop one line early.
+     *
+     * @return A flag set once the walk notified the permission change.
+     */
+    private AtomicBoolean registerRecordingActivityHelper() {
+        final AtomicBoolean notified = new AtomicBoolean();
+        ComponentUtil.register(new ActivityHelper() {
+            @Override
+            public void permissionChanged(final OptionalThing<FessUserBean> userBean) {
+                notified.set(true);
+            }
+        }, "activityHelper");
+        return notified;
+    }
+
+    @Test
+    public void test_runParentGroupLookup_stopsOnceGraphKeepsFailingAndKeepsWhatItHas() {
+        // 15.7 was bounded here only by accident: Guava wraps CurlException in
+        // UncheckedExecutionException, 15.7 caught only ExecutionException, and the task-level
+        // catch(Exception) aborted the whole walk at the first group. 15.8 widened that catch and
+        // lost the bound with it, so a Graph that answers /me/memberOf and then fails every
+        // getMemberGroups costs one request -- up to graphConnectTimeout + graphReadTimeout each --
+        // and one stack trace per direct group, on every login, on the shared TimeoutManager pool.
+        final ScriptedAuthenticator authenticator = newScriptedAuthenticator();
+        authenticator.setMaxConsecutiveGroupLookupFailures(3);
+        authenticator.parents.put("ok-0", new String[] { "parent-0" });
+        authenticator.parents.put("ok-4", new String[] { "parent-4" });
+        authenticator.failing.add("bad-1");
+        authenticator.failing.add("bad-2");
+        authenticator.failing.add("bad-3");
+        final EntraIdUser user = newUserWithoutGraph();
+        registerRecordingActivityHelper();
+        final AtomicBoolean notified = registerRecordingActivityHelper();
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            authenticator.runParentGroupLookup(user, List.of("direct-group"), List.of(),
+                    List.of("ok-0", "bad-1", "bad-2", "bad-3", "ok-4", "ok-5"));
+
+            assertEquals(List.of("ok-0", "bad-1", "bad-2", "bad-3"), authenticator.lookups);
+            // Everything resolved before the bound is still applied: dropping it would take
+            // permissions away from a user who had them a minute earlier.
+            assertEquals(List.of("direct-group", "parent-0"), List.of(user.getGroupNames()));
+            assertTrue(logs.warnings().toString(),
+                    logs.warnings()
+                            .stream()
+                            .anyMatch(m -> m.contains("Stopped resolving nested groups") && m.contains("2 of 6 groups were not walked")));
+            // Giving up on the rest is not giving up on the walk: the session still has to be told
+            // about the nested groups that did resolve.
+            assertTrue("the permission change still has to be notified", notified.get());
+        } finally {
+            logs.detach();
+        }
+    }
+
+    @Test
+    public void test_runParentGroupLookup_letsASuccessResetTheConsecutiveFailureCount() {
+        // Consecutive rather than total is the whole point: one group that is permanently broken
+        // must not stop the walk over every other group the user belongs to.
+        final ScriptedAuthenticator authenticator = newScriptedAuthenticator();
+        authenticator.setMaxConsecutiveGroupLookupFailures(3);
+        authenticator.parents.put("ok-3", new String[] { "parent-3" });
+        authenticator.parents.put("ok-7", new String[] { "parent-7" });
+        List.of("bad-1", "bad-2", "bad-4", "bad-5", "bad-6").forEach(authenticator.failing::add);
+        final EntraIdUser user = newUserWithoutGraph();
+        registerRecordingActivityHelper();
+
+        authenticator.runParentGroupLookup(user, List.of(), List.of(),
+                List.of("bad-1", "bad-2", "ok-3", "bad-4", "bad-5", "bad-6", "ok-7"));
+
+        // Two failures, then a success that puts the counter back to zero, then three more.
+        assertEquals(List.of("bad-1", "bad-2", "ok-3", "bad-4", "bad-5", "bad-6"), authenticator.lookups);
+        assertEquals(List.of("parent-3"), List.of(user.getGroupNames()));
+    }
+
+    @Test
+    public void test_runParentGroupLookup_doesNotCountAnEmptyAnswerAsAFailure() {
+        // An empty parent list is an answer, and it is also what getMemberGroupIds maps Graph's
+        // Request_ResourceNotFound and Authorization_RequestDenied onto. A tenant whose first
+        // groups are all top-level would otherwise stop the walk before reaching the nested ones.
+        final ScriptedAuthenticator authenticator = newScriptedAuthenticator();
+        authenticator.setMaxConsecutiveGroupLookupFailures(3);
+        authenticator.parents.put("nested-4", new String[] { "parent-4" });
+        final EntraIdUser user = newUserWithoutGraph();
+        registerRecordingActivityHelper();
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            authenticator.runParentGroupLookup(user, List.of(), List.of(), List.of("top-0", "top-1", "top-2", "top-3", "nested-4"));
+
+            assertEquals(List.of("top-0", "top-1", "top-2", "top-3", "nested-4"), authenticator.lookups);
+            assertEquals(List.of("parent-4"), List.of(user.getGroupNames()));
+            assertTrue(logs.warnings().toString(), logs.warnings().stream().noneMatch(m -> m.contains("Stopped resolving nested groups")));
+        } finally {
+            logs.detach();
+        }
+    }
+
+    @Test
+    public void test_runParentGroupLookup_doesNotCountAThrottledSkipAsAFailure() {
+        // While Graph is throttling, getParentGroup short-circuits before it reaches the network.
+        // That is a deliberate skip, not an unanswered lookup, so it must not consume the bound --
+        // otherwise the walk would also stop looking at the ids whose answers are already cached.
+        final List<String> visited = new ArrayList<>();
+        final ScriptedAuthenticator authenticator = new ScriptedAuthenticator() {
+            @Override
+            protected boolean processParentGroup(final EntraIdUser user, final List<String> groupList, final List<String> roleList,
+                    final String id, final int depth, final boolean logStackTrace) {
+                visited.add(id);
+                return super.processParentGroup(user, groupList, roleList, id, depth, logStackTrace);
+            }
+        };
+        authenticator.groupCache = CacheBuilder.newBuilder().build();
+        authenticator.setMaxConsecutiveGroupLookupFailures(3);
+        ComponentUtil.register(new SystemHelper() {
+            @Override
+            public long getCurrentTimeAsLong() {
+                return clock.get();
+            }
+        }, "systemHelper");
+        authenticator.graphThrottledUntil = clock.get() + 60_000L;
+        final EntraIdUser user = newUserWithoutGraph();
+        registerRecordingActivityHelper();
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            authenticator.runParentGroupLookup(user, List.of(), List.of(), List.of("group-0", "group-1", "group-2", "group-3", "group-4"));
+
+            assertEquals(List.of("group-0", "group-1", "group-2", "group-3", "group-4"), visited);
+            assertTrue(authenticator.lookups.toString(), authenticator.lookups.isEmpty());
+            assertTrue(logs.warnings().toString(), logs.warnings().stream().noneMatch(m -> m.contains("Stopped resolving nested groups")));
+        } finally {
+            logs.detach();
+        }
+    }
+
+    @Test
+    public void test_runParentGroupLookup_logsOneStackTracePerWalk() {
+        // The bound alone does not bound the log volume: a walk that alternates success and
+        // failure never reaches the consecutive limit, so without this it would still print one
+        // stack trace per failing group. One is enough to diagnose the outage; the rest bury it.
+        final ScriptedAuthenticator authenticator = newScriptedAuthenticator();
+        authenticator.setMaxConsecutiveGroupLookupFailures(3);
+        authenticator.parents.put("ok-2", new String[] { "parent-2" });
+        authenticator.failing.add("bad-1");
+        authenticator.failing.add("bad-3");
+        final EntraIdUser user = newUserWithoutGraph();
+        final LogCapturingAppender logs = LogCapturingAppender.attach(EntraIdAuthenticator.class);
+        try {
+            authenticator.runParentGroupLookup(user, List.of(), List.of(), List.of("bad-1", "ok-2", "bad-3"));
+
+            final List<LogEvent> failures = logs.eventsAt(Level.WARN)
+                    .stream()
+                    .filter(e -> e.getMessage().getFormattedMessage().contains("Failed to process group cache for id"))
+                    .toList();
+            assertEquals(logs.warnings().toString(), 2, failures.size());
+            assertNotNull(failures.get(0).getThrown(), "the first failure keeps its stack trace");
+            assertNull(failures.get(1).getThrown(), "the rest are one line each");
+            // The one-liner still has to name the cause, or it is not actionable on its own.
+            assertTrue(failures.get(1).getMessage().getFormattedMessage(),
+                    failures.get(1).getMessage().getFormattedMessage().contains("simulated Graph failure for bad-3"));
+        } finally {
+            logs.detach();
+        }
     }
 
     @Test
@@ -1204,7 +1386,7 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         final List<String> groupList = new ArrayList<>();
         final List<String> roleList = new ArrayList<>();
 
-        authenticator.processParentGroup(null, groupList, roleList, "test-id");
+        assertTrue("an answered lookup has to report success", authenticator.processParentGroup(null, groupList, roleList, "test-id"));
 
         assertTrue(authenticator.lookups.contains("test-id"));
         assertEquals(1, groupList.size());
@@ -1221,7 +1403,9 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         List<String> roleList = new ArrayList<>();
 
         // Test with depth exceeding limit - should return immediately
-        authenticator.processParentGroup(null, groupList, roleList, "test-id", 5);
+        // The depth limit is a bound we chose, not a Graph failure, so it reports success: making
+        // it count as a failure would let a misconfigured maxGroupDepth stop the whole walk.
+        assertTrue("the depth limit is not a lookup failure", authenticator.processParentGroup(null, groupList, roleList, "test-id", 5));
 
         // Lists should remain empty as depth limit prevents processing
         assertEquals(0, groupList.size());
@@ -1409,8 +1593,9 @@ public class EntraIdAuthenticatorTest extends UnitFessTestCase {
         List<String> groupList = new ArrayList<>();
         List<String> roleList = new ArrayList<>();
 
-        // With depth >= maxGroupDepth, should return immediately without error
-        authenticator.processParentGroup(null, groupList, roleList, "test-id", 10);
+        // With depth >= maxGroupDepth, should return immediately without error, and report the
+        // bound as answered rather than as a Graph failure.
+        assertTrue("the depth limit is not a lookup failure", authenticator.processParentGroup(null, groupList, roleList, "test-id", 10));
 
         assertEquals("groupList should remain empty", 0, groupList.size());
         assertEquals("roleList should remain empty", 0, roleList.size());
