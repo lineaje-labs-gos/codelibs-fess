@@ -422,7 +422,7 @@ public class LdapManager {
         final Set<String> roleSet = new HashSet<>();
 
         if (fessConfig.isLdapRoleSearchUserEnabled()) {
-            roleSet.add(normalizePermissionName(getUserSearchRole(ldapUser, systemHelper)));
+            roleSet.add(getUserPermissionName(ldapUser));
         }
 
         // LDAP: cn=%s
@@ -663,6 +663,25 @@ public class LdapManager {
             return systemHelper.getSearchRoleByDirectoryUser(ldapUser.getName());
         }
         return systemHelper.getSearchRoleByUser(ldapUser.getName());
+    }
+
+    /**
+     * Names the permission that stands for this user themselves.
+     *
+     * <p>The one place that name is spelled. {@link LdapUser#getPermissions()} needs it too -- it
+     * appends the user's own permission to both the synchronous result and the nested-group walk's
+     * later write, so that the lazy write does not hand back a strictly smaller set -- and building
+     * it there from its parts instead let the two spellings diverge: normalizing the whole name is
+     * not the same as normalizing what follows the prefix once the prefix has a case of its own,
+     * and re-reading a provider-asserted name as a NetBIOS-qualified one is the very thing
+     * {@link #getUserSearchRole} exists to avoid. Both then landed in the same set, so one login
+     * carried two permissions for one identity.
+     *
+     * @param ldapUser the user logging in
+     * @return the user's own permission name
+     */
+    public String getUserPermissionName(final LdapUser ldapUser) {
+        return normalizePermissionName(getUserSearchRole(ldapUser, ComponentUtil.getSystemHelper()));
     }
 
     /**

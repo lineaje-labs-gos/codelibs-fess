@@ -176,6 +176,45 @@ public class LdapManagerTest extends UnitFessTestCase {
         assertEquals("1alice", ldapManager.getUserSearchRole(new LdapUser(new Hashtable<>(), "alice", true), systemHelper));
     }
 
+    /**
+     * The user's own permission has one spelling, and both places that need it read it from here.
+     *
+     * <p>LdapUser used to build its copy as {@code prefix + normalizePermissionName(name)} while
+     * this class built it as {@code normalizePermissionName(prefix + name)}. The two agree only
+     * while the prefix has no case of its own -- the shipped user prefix is "1" -- and diverge as
+     * soon as it does, which put two differently spelled permissions for one identity into the same
+     * set. They also disagreed about a provider-asserted name, since only this class knows whether
+     * a backslash in it is a NetBIOS qualifier or a character of the name.
+     */
+    @Test
+    public void test_getUserPermissionName_hasOneSpelling() {
+        ComponentUtil.setFessConfig(new FessConfig.SimpleImpl() {
+            @Override
+            public boolean isLdapIgnoreNetbiosName() {
+                return true;
+            }
+
+            @Override
+            public String getRoleSearchUserPrefix() {
+                return "U";
+            }
+
+            @Override
+            public boolean isLdapLowercasePermissionName() {
+                return true;
+            }
+        });
+        final LdapManager ldapManager = new LdapManager();
+        ldapManager.init();
+
+        // Folding applies to the name the prefix is already part of, so there is one spelling to
+        // index documents under and one to hand the user -- not "ualice" here and "Ualice" there.
+        assertEquals("ualice", ldapManager.getUserPermissionName(new LdapUser(new Hashtable<>(), "Alice")));
+        assertEquals("ualice", ldapManager.getUserPermissionName(new LdapUser(new Hashtable<>(), "EXAMPLE\\Alice")));
+        // And the asserted-name distinction survives being routed through here.
+        assertEquals("uzz\\alice", ldapManager.getUserPermissionName(new LdapUser(new Hashtable<>(), "zz\\Alice", true)));
+    }
+
     @Test
     public void test_replaceWithUnderscores() {
         LdapManager ldapManager = new LdapManager();
