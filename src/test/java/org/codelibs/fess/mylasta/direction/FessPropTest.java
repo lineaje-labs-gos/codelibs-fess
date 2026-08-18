@@ -94,6 +94,42 @@ public class FessPropTest extends UnitFessTestCase {
         assertEquals("1234567890@fess.codelibs.local", fessConfig.getLdapSecurityPrincipal("12345678901"));
     }
 
+    /**
+     * authentication.admin.users names the accounts Fess keeps for itself, and for SSO it acts as a
+     * block list: SpnegoAuthenticator resolves no credential for a name it matches. The directories
+     * that assert those names do not distinguish case in an account name, so the comparison must not
+     * either -- otherwise the same account gets in under another spelling, and where
+     * ldap.lowercase.permission.name folds the permission name it gets in holding the permission the
+     * reserved name carries.
+     */
+    @Test
+    public void test_isAdminUser_ignoresCase() {
+        FessProp.propMap.clear();
+        final FessConfig fessConfig = new FessConfig.SimpleImpl() {
+            @Override
+            public String getAuthenticationAdminUsers() {
+                return "admin,operator";
+            }
+        };
+
+        assertTrue(fessConfig.isAdminUser("admin"));
+        assertTrue(fessConfig.isAdminUser("ADMIN"));
+        assertTrue(fessConfig.isAdminUser("Admin"));
+        assertTrue(fessConfig.isAdminUser("aDmIn"));
+        assertTrue(fessConfig.isAdminUser("operator"));
+        assertTrue(fessConfig.isAdminUser("OPERATOR"));
+
+        // Only the names it lists, whatever their case: a longer or shorter name is a different one.
+        assertFalse(fessConfig.isAdminUser("admin2"));
+        assertFalse(fessConfig.isAdminUser("adm"));
+        assertFalse(fessConfig.isAdminUser("alice"));
+        assertFalse(fessConfig.isAdminUser(""));
+        assertFalse(fessConfig.isAdminUser(null));
+
+        // isLdapAdminEnabled refuses to make a reserved name editable for the same reason.
+        assertFalse(fessConfig.isLdapAdminEnabled("ADMIN"));
+    }
+
     @Test
     public void test_validateIndexRequiredFields() {
         FessProp.propMap.clear();

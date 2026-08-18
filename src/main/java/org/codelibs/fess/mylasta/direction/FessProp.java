@@ -1318,8 +1318,23 @@ public interface FessProp {
 
     String getAuthenticationAdminUsers();
 
+    /**
+     * Tells whether the given name is one of the names authentication.admin.users reserves.
+     *
+     * <p>Compared without regard to case. For SSO this setting is a block list -- SpnegoAuthenticator
+     * resolves no credential for a name it matches -- and the directories that assert those names do
+     * not distinguish case in an account name, so Active Directory issues a ticket for any casing of
+     * one. Comparing exactly let the same account back in under a different spelling, and where
+     * ldap.lowercase.permission.name folds the permission name the login that got in that way was
+     * handed the very permission the reserved name carries.
+     *
+     * <p>The comparison can only refuse more than it did, never less.
+     *
+     * @param username the name to test, as the user typed it or the provider asserted it
+     * @return true when the name is reserved
+     */
     default boolean isAdminUser(final String username) {
-        return split(getAuthenticationAdminUsers(), ",").get(stream -> stream.anyMatch(s -> s.equals(username)));
+        return split(getAuthenticationAdminUsers(), ",").get(stream -> stream.anyMatch(s -> s.equalsIgnoreCase(username)));
     }
 
     boolean isLdapAdminEnabled();
